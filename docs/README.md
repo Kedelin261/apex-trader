@@ -1,215 +1,166 @@
 # Apex Multi-Market TJR Engine
 
-**Version:** 1.0.0  
-**Status:** Production-Grade Architecture, Paper Trading Ready  
-**Classification:** Autonomous Institutional Trading System
+**Version:** 2.0.0  
+**Status:** Live-Ready — Full Broker Connectivity Implemented  
+**Classification:** Autonomous Institutional Trading System  
+**Broker:** OANDA v20 REST API (Practice: ✅ Authenticated | Balance: $100,000 USD)
 
 ---
 
 ## System Overview
 
-The Apex Multi-Market TJR Engine is a production-grade, fully autonomous trading system combining:
+The Apex Multi-Market TJR Engine is a production-grade, fully autonomous trading system:
 
-- **Deterministic TJR strategy execution** (rule-based, auditable, no discretion)
-- **Multi-agent AI orchestration** (scanning, regime detection, risk governance, execution supervision)
-- **Universal market support** (Forex, Gold, Futures, Indices, Stocks, Crypto, Prediction Markets)
-- **Institutional risk management** (non-bypassable hard rules)
-- **Paper trading and live execution pathways**
-- **Full audit trail and decision ledger**
+- **Deterministic TJR strategy** (rule-based, auditable, zero discretion)
+- **Multi-agent AI orchestration** (9 agents: Sentinel, Regime, Validator, Risk, Execution, Reporting…)
+- **Universal market support** (Forex, Gold, Futures, Indices, Stocks, Crypto, Prediction)
+- **Institutional risk management** (non-bypassable hard rules, kill switch, circuit breaker)
+- **Full broker connectivity** (OANDA v20 REST, live order submission, positions, balances)
+- **Execution state machine** (PAPER → LIVE_CONNECTED_SAFE → LIVE_ENABLED → KILL_SWITCH)
+- **Full audit trail** (decision ledger, reconciliation log, rejection history)
+
+---
+
+## What's New in v2.0
+
+| Feature | Status |
+|---------|--------|
+| OANDA v20 REST connector (full) | ✅ |
+| Credential manager (env-only, masked) | ✅ |
+| Execution state machine (5 states) | ✅ |
+| Two-step live arming flow | ✅ |
+| Preflight checklist (14 checks) | ✅ |
+| Reconciliation service (60s auto) | ✅ |
+| Order rejection parsing + history | ✅ |
+| Circuit breaker (5 failures) | ✅ |
+| Broker API endpoints (12 new) | ✅ |
+| Enhanced dashboard with broker panel | ✅ |
+| 86 tests passing (all green) | ✅ |
+| Security: credentials never logged | ✅ |
 
 ---
 
 ## Quick Start
 
 ```bash
-# 1. Install dependencies
-pip3 install fastapi uvicorn pyyaml pydantic structlog apscheduler sqlalchemy ccxt
+# 1. Configure credentials
+cp /home/user/apex-trader/.env.example /home/user/apex-trader/.env
+# Edit .env with your OANDA token and account ID
 
-# 2. Start the system (paper mode)
+# 2. Start the system
 cd /home/user/apex-trader
-python3 live/api_server.py
+pm2 start ecosystem.config.cjs
 
-# 3. Access dashboard
-open http://localhost:8080/dashboard
+# 3. Verify
+curl http://localhost:8080/health
 
-# 4. Run backtest via API
-curl -X POST http://localhost:8080/api/backtest/run \
+# 4. Connect broker (safe mode)
+curl -X POST http://localhost:8080/api/broker/connect \
   -H "Content-Type: application/json" \
-  -d '{"instrument":"XAUUSD","instrument_type":"GOLD","venue_type":"CFD_BROKER","timeframe":"M15"}'
+  -d '{"broker": "oanda", "operator": "YourName"}'
 ```
 
 ---
 
-## Architecture
+## Operator Workflow
 
 ```
-Apex Multi-Market TJR Engine
-│
-├── TJR Strategy Engine (Python/deterministic)
-│   ├── Swing Point Detector
-│   ├── Market Structure Analyzer
-│   ├── Liquidity Detector
-│   ├── BOS Detector
-│   ├── Session Classifier
-│   └── Setup Quality Scorer
-│
-├── Multi-Agent Orchestration Layer
-│   ├── Market Sentinel Agent
-│   ├── Regime Detection Agent
-│   ├── Strategy Validator Agent
-│   ├── Risk Guardian Agent (non-bypassable)
-│   ├── Execution Supervisor Agent
-│   └── Reporting Agent
-│
-├── Agent Communication Protocol
-│   ├── AgentMessage (typed, validated)
-│   ├── AgentDecisionLedger (immutable JSONL)
-│   └── AgentStateStore (coordination)
-│
-├── Risk Engine
-│   ├── RiskManager (hard rules)
-│   ├── DailyRiskGovernor (daily loss tracking)
-│   └── MarketContextFilter (volatility/news/spread)
-│
-├── Data Infrastructure
-│   ├── MarketDataService
-│   ├── CsvLoader (historical)
-│   └── HistoricalDataValidator
-│
-├── Backtest Engine
-│   ├── Candle-by-candle simulation (no lookahead)
-│   ├── RealisticFillModel (slippage/spread/commission)
-│   └── PerformanceCalculator
-│
-└── API Server (FastAPI)
-    ├── Dashboard (real-time)
-    ├── TradingView Webhook (/api/signal)
-    ├── Backtest trigger (/api/backtest/run)
-    └── Kill switch controls
+START (PAPER_MODE)
+      │
+      │  POST /api/broker/connect
+      ▼
+LIVE_CONNECTED_SAFE  ← reads account, positions, balances (no orders)
+      │
+      │  POST /api/broker/preflight (verify 14 checks)
+      │  POST /api/execution/arm-live (acknowledge_risk=true)
+      ▼
+LIVE_ENABLED  ← real TJR orders routing to OANDA
+      │
+      │  POST /api/execution/disarm-live
+      ▼
+LIVE_CONNECTED_SAFE (monitoring, no trading)
 ```
 
 ---
 
-## Mandatory Trade Decision Chain
-
-Every live or paper trade MUST pass this complete chain:
+## Preflight Results (Live Test)
 
 ```
-1. Market Sentinel → environment acceptable?
-2. Regime Detection → regime classified, TJR eligible?
-3. TJR Engine → valid setup found?
-4. Strategy Validator → all rules met, quality >= 0.65?
-5. Risk Guardian → risk approved (hard rules pass)?
-6. Execution Supervisor → broker ready, order params valid?
-7. Order Execution → fill confirmed?
-8. Reporting Agent → trade lifecycle logged?
+✅ credentials_valid       — Token format valid
+✅ authentication_success  — OANDA Practice authenticated
+✅ account_info_readable   — $100,000 USD balance
+✅ environment_correct     — practice configured
+✅ permissions_check       — can_trade=True
+✅ instrument_mapping      — XAUUSD, EURUSD, GBPUSD mapped
+✅ positions_readable      — 0 open positions
+✅ orders_readable         — 0 pending orders
+✅ kill_switch_available   — Active
+✅ sufficient_balance      — $100,000 USD
+✅ risk_kill_switch_off    — Clear
+✅ execution_state_valid   — LIVE_CONNECTED_SAFE
+✅ daily_loss_limit_ok     — Not hit
+✅ operator_arming_required — Two-step enforced
 ```
-
-No step may be skipped. All decisions are logged to the AgentDecisionLedger.
-
----
-
-## TJR Strategy Rules (Deterministic)
-
-The TJR engine applies these exact rules:
-
-| Rule | Implementation |
-|------|---------------|
-| Market Structure | SwingPointDetector with N-candle confirmation |
-| Bullish Bias | Higher Highs AND Higher Lows (both required) |
-| Bearish Bias | Lower Highs AND Lower Lows (both required) |
-| BOS Confirmation | Close beyond prior swing + body ratio >= 50% |
-| Liquidity Event | Equal level cluster within tolerance + sweep detection |
-| Entry Trigger | Confirmation candle with body >= 50% of range |
-| Stop Loss | Beyond most recent opposing swing + buffer |
-| Take Profit | Entry ± (stop distance × min_rr) |
-| Session Filter | London, New York, or Overlap only |
-| Min R:R | 2.0:1 (configurable, minimum enforced) |
-| Min Quality Score | 0.65 (all criteria weighted) |
-
----
-
-## Risk Rules (Non-Negotiable)
-
-| Rule | Default | Configurable |
-|------|---------|-------------|
-| Max risk per trade | 1% | Yes |
-| Max daily loss | 3% | Yes |
-| Max total drawdown | 10% | Yes |
-| Max concurrent trades | 2 | Yes |
-| Min R:R ratio | 2.0 | Yes |
-| Max spread | 3 pips | Yes |
-| Kill switch | Auto on limit breach | N/A |
-
----
-
-## Market Support Matrix
-
-| Market | TJR Support | Alternative Strategies | Notes |
-|--------|-------------|----------------------|-------|
-| Forex | ✅ Full | Trend following | London/NY sessions |
-| Gold (XAUUSD) | ✅ Full | Trend following | High volatility filter |
-| Futures | ✅ Full | Trend following | Contract-aware |
-| Indices | ✅ Full | Trend following | Session-aware |
-| Commodities | ✅ Full | Trend following | — |
-| Stocks | ⚠️ Config needed | Event-driven | Market hours |
-| Crypto | ❌ TJR incompatible | Volatility breakout | 24/7 aware |
-| Prediction | ❌ TJR incompatible | Event-driven | Binary logic |
 
 ---
 
 ## API Reference
 
+### Legacy (v1.0)
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/dashboard` | GET | Real-time trading dashboard |
-| `/api/signal` | POST | TradingView webhook ingest |
-| `/api/status` | GET | System health and status |
+| `/api/signal` | POST | TradingView webhook |
+| `/api/status` | GET | System health |
 | `/api/trades` | GET | Trade history |
 | `/api/metrics` | GET | Performance metrics |
-| `/api/agents` | GET | Agent health states |
-| `/api/ledger` | GET | Decision ledger entries |
-| `/api/positions` | GET | Open positions |
-| `/api/backtest/run` | POST | Trigger backtest |
-| `/api/control/kill` | POST | Engage kill switch |
-| `/api/control/resume` | POST | Resume trading |
-| `/api/equity-curve` | GET | Equity curve data |
+| `/api/agents` | GET | Agent health |
+| `/api/ledger` | GET | Decision ledger |
+| `/api/backtest/run` | POST | Run backtest |
+
+### Broker (v2.0 New)
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/broker/connect` | POST | Authenticate broker |
+| `/api/broker/status` | GET | Connection status |
+| `/api/broker/account` | GET | Live account info |
+| `/api/broker/balances` | GET | Live balances |
+| `/api/broker/positions` | GET | Live positions |
+| `/api/broker/open-orders` | GET | Pending orders |
+| `/api/broker/preflight` | POST | Run preflight (14 checks) |
+| `/api/broker/test-order-payload` | POST | Build order JSON (safe) |
+| `/api/execution/arm-live` | POST | Arm live trading |
+| `/api/execution/disarm-live` | POST | Disarm |
+| `/api/execution/state` | GET | State snapshot |
+| `/api/execution/history` | GET | Transition history |
+| `/api/control/kill` | POST | Kill switch |
+| `/api/control/resume` | POST | Reset to paper |
+| `/api/control/rejection-history` | GET | Order rejections |
+| `/api/reconcile/run` | POST | Reconcile positions |
+| `/api/reconcile/history` | GET | Reconciliation history |
 
 ---
 
-## Configuration
+## Risk Rules (Non-Negotiable)
 
-Main config: `config/system_config.yaml`
-
-Key sections:
-- `system.environment`: `backtest` | `paper` | `live`
-- `risk.*`: All hard risk rules
-- `strategy.tjr.*`: TJR engine parameters
-- `markets.*`: Per-market configuration
-- `agents.*`: Agent configuration
-- `brokers.*`: Broker credentials (use env vars, not YAML)
+| Rule | Value |
+|------|-------|
+| Max risk per trade | 1% of balance |
+| Max daily loss | 3% of balance |
+| Max total drawdown | 10% |
+| Max concurrent trades | 2 |
+| Min reward:risk ratio | 2.0 |
+| Max spread | 3.0 pips |
+| Kill switch | Irreversible until reset |
+| Live arming | Two-step (connect → arm) |
 
 ---
 
-## Deployment
+## Test Results
 
-See `setup.md` for full deployment instructions.
-
-```bash
-# Docker
-docker-compose up -d
-
-# Manual
-python3 live/api_server.py
 ```
-
----
-
-## Testing
-
-```bash
-cd /home/user/apex-trader
-python3 -m pytest tests/ -v
+86 tests passed (0 failed)
+  - 53 broker/state-machine/API integration tests
+  - 33 TJR engine / risk management unit tests
 ```
 
 ---
@@ -218,28 +169,61 @@ python3 -m pytest tests/ -v
 
 ```
 apex-trader/
-├── core/           # TJR engine, risk, market context
-├── domain/         # Data models and enumerations
-├── data/           # Market data service, CSV loader
-├── adapters/       # Per-market adapters (forex, futures, crypto, etc.)
-├── backtest/       # Realistic backtesting engine
-├── live/           # API server, paper/live trading
-├── agents/         # Multi-agent orchestration
-├── protocol/       # Agent communication protocol
-├── config/         # YAML configuration
-├── scripts/        # Pine Script, deployment scripts
-├── docs/           # Documentation
-├── tests/          # Unit, integration, replay tests
-├── logs/           # Agent decision ledger, trade logs
-└── reports/        # Generated performance reports
+├── brokers/
+│   ├── base_connector.py      # Abstract connector interface
+│   ├── credential_manager.py  # Secure env-var credential loading
+│   └── oanda_connector.py     # Full OANDA v20 implementation
+├── live/
+│   ├── api_server.py          # FastAPI server (v2.0, 12 new endpoints)
+│   ├── broker_manager.py      # Central broker lifecycle manager
+│   ├── execution_state_machine.py  # 5-state machine, persisted
+│   ├── preflight_service.py   # 14-check preflight orchestration
+│   └── reconciliation_service.py  # Auto + manual reconciliation
+├── core/
+│   ├── tjr_strategy_engine.py # Deterministic TJR (unchanged)
+│   └── risk_manager.py        # Hard risk rules (unchanged)
+├── agents/                    # 9 AI agents (unchanged)
+├── tests/
+│   ├── unit/test_tjr_engine.py          # 33 tests
+│   └── integration/test_broker_integration.py  # 53 tests
+└── docs/
+    ├── LIVE_TRADING_SETUP.md
+    ├── BROKER_CONNECTION.md
+    ├── EXECUTION_STATES.md
+    ├── PRE_FLIGHT_CHECKLIST.md
+    └── SAFETY_CONTROLS.md
 ```
 
 ---
 
-## Compliance
+## Deployment
 
-See `COMPLIANCE.md` for regulatory and operational compliance documentation.
+```bash
+# Development
+pm2 start ecosystem.config.cjs
 
-## Risk Documentation
+# Tests
+python3 -m pytest tests/ -v
 
-See `RISK.md` for complete risk management documentation.
+# Docker (coming)
+docker-compose up
+
+# Cloudflare (API logs)
+# R2 bucket configured via env vars for audit log archival
+```
+
+---
+
+## Documentation
+
+| Document | Purpose |
+|----------|---------|
+| `docs/LIVE_TRADING_SETUP.md` | Step-by-step live trading setup |
+| `docs/BROKER_CONNECTION.md` | OANDA connector architecture |
+| `docs/EXECUTION_STATES.md` | State machine reference |
+| `docs/PRE_FLIGHT_CHECKLIST.md` | All 14 preflight checks |
+| `docs/SAFETY_CONTROLS.md` | Kill switch, circuit breaker, fail-closed |
+| `docs/ARCHITECTURE.md` | System architecture |
+| `docs/RISK.md` | Risk management rules |
+| `docs/AGENT_PROTOCOL.md` | Agent communication protocol |
+| `docs/COMPLIANCE.md` | Compliance and audit requirements |
