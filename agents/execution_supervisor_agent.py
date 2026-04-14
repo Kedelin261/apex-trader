@@ -143,16 +143,135 @@ class ExecutionSupervisorAgent(BaseAgent):
             is_paper=signal.is_paper_trade
         )
 
-        # Execute (paper or live)
-        if signal.is_paper_trade or self.broker is None:
-            # Paper execution: simulate fill
+        # Execute via the broker interface.
+        # self.broker is a BrokerManager instance when wired from the API server.
+        # BrokerManager.submit_order() internally routes:
+        #   - LIVE_ENABLED  → real OANDA connector
+        #   - all other ESM states → PaperBroker
+        # This preserves the execution state machine's gating without bypass.
+
+        if self.broker is not None and hasattr(self.broker, "submit_order"):
+            # ── Unified path: BrokerManager.submit_order() handles routing ──
+            try:
+                from brokers.base_connector import (
+                    OrderRequest,
+                    OrderSide as BrokerOrderSide,
+                    OrderType as BrokerOrderType,
+                )
+
+                broker_side = (
+                    BrokerOrderSide.BUY
+                    if signal.direction == SignalDirection.BUY
+                    else BrokerOrderSide.SELL
+                )
+
+                order_req = OrderRequest(
+                    instrument=signal.instrument,
+                    side=broker_side,
+                    units=signal.position_size_lots,
+                    order_type=BrokerOrderType.MARKET,
+                    price=signal.entry_price,
+                    stop_loss=signal.stop_loss,
+                    take_profit=signal.take_profit,
+                    client_order_id=order.order_id,
+                    comment=(
+                        f"apex_signal:{signal.signal_id[:8]} "
+                        f"{signal.strategy_family.value}"
+                    ),
+                )
+
+                result = self.broker.submit_order(order_req)
+
+                if result.success:
+                    order.broker_order_id = result.order_id
+                    order.filled_price = result.filled_price or signal.entry_price
+                    order.status = "FILLED"
+                    self._consecutive_failures = 0
+
+                    is_paper = getattr(result, "raw", {}).get("paper", False)
+                    msg = self.emit(
+                        message_type=AgentMessageType.ORDER_FILLED,
+                        payload={
+                            "signal_id": signal.signal_id,
+                            "order_id": order.order_id,
+                            "broker_order_id": order.broker_order_id,
+                            "instrument": signal.instrument,
+                            "direction": signal.direction.value,
+                            "filled_price": order.filled_price,
+                            "quantity": order.quantity,
+                            "is_paper": is_paper,
+                            "sl": signal.stop_loss,
+                            "tp": signal.take_profit,
+                        },
+                        priority=MessagePriority.HIGH,
+                        instrument=signal.instrument,
+                        final_status="FILLED",
+                        parent_message_id=parent_msg_id,
+                    )
+                    logger.info(
+                        f"[ExecutionSupervisor] ORDER FILLED: "
+                        f"{signal.instrument} {signal.direction.value} "
+                        f"@ {order.filled_price:.5f} "
+                        f"({'PAPER' if is_paper else 'LIVE'} "
+                        f"{signal.position_size_lots:.2f} lots)"
+                    )
+                else:
+                    # Broker rejected the order (e.g. insufficient funds,
+                    # kill switch, ESM not in LIVE_ENABLED, etc.)
+                    self._consecutive_failures += 1
+                    if self._consecutive_failures >= self.circuit_breaker_failures:
+                        self._circuit_open = True
+                        logger.critical(
+                            f"[ExecutionSupervisor] Circuit breaker OPENED after "
+                            f"{self._consecutive_failures} failures"
+                        )
+
+                    reject_reason = result.reject_reason or "Order rejected by broker/ESM"
+                    msg = self.emit(
+                        message_type=AgentMessageType.ORDER_FAILED,
+                        payload={
+                            "signal_id": signal.signal_id,
+                            "instrument": signal.instrument,
+                            "reject_reason": reject_reason,
+                            "insufficient_funds": getattr(result, "insufficient_funds", False),
+                            "consecutive_failures": self._consecutive_failures,
+                        },
+                        priority=MessagePriority.CRITICAL,
+                        instrument=signal.instrument,
+                        final_status="FAILED",
+                        rejection_reasons=[reject_reason],
+                        parent_message_id=parent_msg_id,
+                    )
+                    logger.error(
+                        f"[ExecutionSupervisor] ORDER REJECTED by broker: "
+                        f"{reject_reason}"
+                    )
+
+            except Exception as e:
+                self._consecutive_failures += 1
+                msg = self.emit(
+                    message_type=AgentMessageType.ORDER_FAILED,
+                    payload={
+                        "signal_id": signal.signal_id,
+                        "error": str(e),
+                        "consecutive_failures": self._consecutive_failures,
+                    },
+                    priority=MessagePriority.CRITICAL,
+                    instrument=signal.instrument,
+                    final_status="FAILED",
+                    rejection_reasons=[str(e)],
+                    parent_message_id=parent_msg_id,
+                )
+                logger.error(f"[ExecutionSupervisor] ORDER EXCEPTION: {e}")
+
+        else:
+            # ── No broker wired at all: pure paper fill ──────────────────────
             order.status = "FILLED"
             order.filled_price = signal.entry_price
             order.filled_quantity = signal.position_size_lots
             order.filled_at = datetime.now(timezone.utc)
             order.broker_order_id = f"PAPER_{order.order_id[:8]}"
-
-            self._consecutive_failures = 0  # Reset on success
+            self._consecutive_failures = 0
 
             msg = self.emit(
                 message_type=AgentMessageType.ORDER_FILLED,
@@ -165,63 +284,18 @@ class ExecutionSupervisorAgent(BaseAgent):
                     "quantity": order.quantity,
                     "is_paper": True,
                     "sl": signal.stop_loss,
-                    "tp": signal.take_profit
+                    "tp": signal.take_profit,
                 },
                 priority=MessagePriority.HIGH,
                 instrument=signal.instrument,
                 final_status="FILLED",
-                parent_message_id=parent_msg_id
+                parent_message_id=parent_msg_id,
             )
-
             logger.info(
-                f"[ExecutionSupervisor] PAPER FILL: {signal.instrument} "
-                f"{signal.direction.value} @ {order.filled_price:.5f} "
-                f"({signal.position_size_lots:.2f} lots)"
+                f"[ExecutionSupervisor] PAPER FILL (no broker): "
+                f"{signal.instrument} {signal.direction.value} "
+                f"@ {order.filled_price:.5f} ({signal.position_size_lots:.2f} lots)"
             )
-        else:
-            # Live execution
-            try:
-                result = self.broker.place_order(
-                    instrument=signal.instrument,
-                    direction=signal.direction.value,
-                    lots=signal.position_size_lots,
-                    stop_loss=signal.stop_loss,
-                    take_profit=signal.take_profit
-                )
-                order.broker_order_id = result.get("order_id")
-                order.filled_price = result.get("fill_price", signal.entry_price)
-                order.status = "FILLED"
-                self._consecutive_failures = 0
-
-                msg = self.emit(
-                    message_type=AgentMessageType.ORDER_FILLED,
-                    payload={
-                        "signal_id": signal.signal_id,
-                        "broker_order_id": order.broker_order_id,
-                        "fill_price": order.filled_price,
-                        "instrument": signal.instrument
-                    },
-                    priority=MessagePriority.HIGH,
-                    instrument=signal.instrument,
-                    final_status="FILLED",
-                    parent_message_id=parent_msg_id
-                )
-            except Exception as e:
-                self._consecutive_failures += 1
-                msg = self.emit(
-                    message_type=AgentMessageType.ORDER_FAILED,
-                    payload={
-                        "signal_id": signal.signal_id,
-                        "error": str(e),
-                        "consecutive_failures": self._consecutive_failures
-                    },
-                    priority=MessagePriority.CRITICAL,
-                    instrument=signal.instrument,
-                    final_status="FAILED",
-                    rejection_reasons=[str(e)],
-                    parent_message_id=parent_msg_id
-                )
-                logger.error(f"[ExecutionSupervisor] ORDER FAILED: {e}")
 
         return msg
 

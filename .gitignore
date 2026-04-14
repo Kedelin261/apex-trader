@@ -27,3 +27,5 @@ dist/
 # Environment
 .env
 .dev.vars
+*.json
+!config/*.json

@@ -15,17 +15,22 @@ Enforces the mandatory decision chain:
 
 No step may be skipped for real-money or paper trades.
 The orchestrator enforces this chain through protocol messages.
+
+External signal entry point (TradingView webhooks):
+  process_external_signal(signal) — runs an externally-supplied Signal object
+  through steps 5–8 of the same decision chain without bypassing any gate.
 """
 
 from __future__ import annotations
 
 import logging
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from domain.models import (
     Signal, TJRSetup, Position, Trade, InstrumentType, VenueType,
-    EnvironmentMode, StrategyHealthState
+    EnvironmentMode, StrategyHealthState, TradeOutcome
 )
 from core.tjr_strategy_engine import TJRStrategyEngine
 from data.market_data_service import MarketDataService
@@ -310,8 +315,6 @@ class AgentOrchestrator:
                 for item in pending_signals:
                     if item["signal"].signal_id == signal_id:
                         sig = item["signal"]
-                        import uuid
-                        from domain.models import Trade, TradeOutcome
                         trade = Trade(
                             signal_id=sig.signal_id,
                             order_id=str(uuid.uuid4()),
@@ -362,6 +365,223 @@ class AgentOrchestrator:
             f"ledger={self.ledger.total_messages}"
         )
 
+        return summary
+
+    # =========================================================================
+    # EXTERNAL SIGNAL PROCESSING  (TradingView webhook → agent pipeline)
+    # =========================================================================
+
+    def process_external_signal(self, signal: Signal) -> dict:
+        """
+        Process an externally-supplied Signal (e.g. from a TradingView webhook)
+        through the mandatory agent decision chain (steps 5-8):
+
+          5. Strategy Validator  →  validates price/SL/TP/RR rules
+          6. Risk Guardian       →  checks drawdown / daily-loss / concurrent positions
+          7. Execution Supervisor →  submits to paper broker or live OANDA depending on ESM state
+          8. Trade record creation on fill
+
+        This method is the only authorised entry point for external signals.
+        It communicates exclusively through the Intent Layer (ledger + state store).
+
+        Returns:
+            dict with keys:
+              status         – KILL_SWITCH_ACTIVE | SIGNAL_REJECTED | RISK_REJECTED |
+                               EXECUTION_BLOCKED | FILLED | ORDER_FAILED
+              cycle          – current cycle number
+              signal_id      – UUID of the processed signal
+              messages_emitted – count of ledger messages added in this call
+              ledger_size    – total ledger size after processing
+              trades_attempted – 0 or 1
+              trades_executed  – 0 or 1
+              rejection_reasons – list[str] explaining any block
+        """
+        if self._kill_switch:
+            logger.warning(
+                f"[Orchestrator] External signal BLOCKED — kill switch active "
+                f"(signal_id={signal.signal_id})"
+            )
+            return {
+                "status": "KILL_SWITCH_ACTIVE",
+                "cycle": self._cycle_count,
+                "signal_id": signal.signal_id,
+                "messages_emitted": 0,
+                "ledger_size": self.ledger.total_messages,
+                "trades_attempted": 0,
+                "trades_executed": 0,
+                "rejection_reasons": ["Kill switch is active — all trading halted"],
+            }
+
+        # ── Increment cycle counter ─────────────────────────────────────────
+        self._cycle_count += 1
+        cycle_messages: List[AgentMessage] = []
+        ledger_before = self.ledger.total_messages
+
+        # ── Record SIGNAL_CANDIDATE in ledger ──────────────────────────────
+        candidate_msg = AgentMessage(
+            source_agent=AgentName.ORCHESTRATOR,
+            message_type=AgentMessageType.SIGNAL_CANDIDATE,
+            payload={
+                "signal_id": signal.signal_id,
+                "instrument": signal.instrument,
+                "direction": signal.direction.value,
+                "entry": signal.entry_price,
+                "sl": signal.stop_loss,
+                "tp": signal.take_profit,
+                "rr": signal.reward_to_risk,
+                "strategy": signal.strategy_family.value,
+                "source": "external_webhook",
+            },
+            instrument=signal.instrument,
+            confidence=signal.confidence_score,
+            final_status="CANDIDATE",
+        )
+        self.ledger.record(candidate_msg)
+        cycle_messages.append(candidate_msg)
+
+        logger.info(
+            f"[Orchestrator] External signal received: cycle={self._cycle_count} "
+            f"signal_id={signal.signal_id} "
+            f"{signal.instrument} {signal.direction.value} "
+            f"entry={signal.entry_price} sl={signal.stop_loss} tp={signal.take_profit}"
+        )
+
+        # ── STEP 5: Strategy Validator ──────────────────────────────────────
+        # Pass through validate_tjr_signal directly (no TJRSetup for external
+        # signals — only the rules that operate on the Signal object itself apply).
+        val_msg = self.strategy_validator.validate_tjr_signal(
+            signal=signal,
+            setup=None,           # No TJRSetup for external signals
+            parent_msg_id=candidate_msg.message_id,
+        )
+        cycle_messages.append(val_msg)
+
+        if val_msg.final_status != "APPROVED":
+            logger.info(
+                f"[Orchestrator] External signal VALIDATOR REJECTED: "
+                f"{'; '.join(val_msg.rejection_reasons)}"
+            )
+            return {
+                "status": "SIGNAL_REJECTED",
+                "cycle": self._cycle_count,
+                "signal_id": signal.signal_id,
+                "messages_emitted": len(cycle_messages),
+                "ledger_size": self.ledger.total_messages,
+                "trades_attempted": 0,
+                "trades_executed": 0,
+                "rejection_reasons": val_msg.rejection_reasons,
+            }
+
+        # Update state store so risk_guardian.run() could also see it
+        validated_signals_state = self.state_store.get("validated_signals", {})
+        validated_signals_state[signal.signal_id] = {
+            "approved": True,
+            "message_id": val_msg.message_id,
+            "reasons": [],
+        }
+        self.state_store.set("validated_signals", validated_signals_state)
+
+        # ── STEP 6: Risk Guardian ───────────────────────────────────────────
+        risk_msg = self.risk_guardian.evaluate_signal(
+            signal=signal,
+            open_positions=self._open_positions,
+            current_spread_pips=1.5,    # Conservative default for external signals
+            regime=None,
+            news_active=False,
+            volatility_spike=False,
+            parent_msg_id=val_msg.message_id,
+        )
+        cycle_messages.append(risk_msg)
+
+        # Check if risk triggered a kill switch
+        kill_events = self.ledger.get_kill_switch_events()
+        if kill_events and not self._kill_switch:
+            self._kill_switch = True
+            logger.critical("[Orchestrator] Kill switch triggered by risk guardian")
+
+        if risk_msg.message_type != AgentMessageType.RISK_APPROVED:
+            logger.info(
+                f"[Orchestrator] External signal RISK REJECTED: "
+                f"{'; '.join(risk_msg.rejection_reasons)}"
+            )
+            return {
+                "status": "RISK_REJECTED",
+                "cycle": self._cycle_count,
+                "signal_id": signal.signal_id,
+                "messages_emitted": len(cycle_messages),
+                "ledger_size": self.ledger.total_messages,
+                "trades_attempted": 1,
+                "trades_executed": 0,
+                "rejection_reasons": risk_msg.rejection_reasons,
+            }
+
+        # ── STEP 7: Execution Supervisor ────────────────────────────────────
+        exec_msg = self.execution_supervisor.submit_order(
+            signal=signal,
+            parent_msg_id=risk_msg.message_id,
+        )
+        cycle_messages.append(exec_msg)
+
+        trades_executed = 0
+        final_status = exec_msg.final_status or "UNKNOWN"
+        rejection_reasons: List[str] = exec_msg.rejection_reasons or []
+
+        # ── STEP 8: Trade record on fill ───────────────────────────────────
+        if exec_msg.message_type == AgentMessageType.ORDER_FILLED:
+            trades_executed = 1
+            trade = Trade(
+                signal_id=signal.signal_id,
+                order_id=str(uuid.uuid4()),
+                instrument=signal.instrument,
+                instrument_type=signal.instrument_type,
+                direction=signal.direction,
+                strategy_family=signal.strategy_family,
+                session=signal.session,
+                entry_price=exec_msg.payload.get("filled_price", signal.entry_price),
+                entry_time=datetime.now(timezone.utc),
+                stop_loss=signal.stop_loss,
+                take_profit=signal.take_profit,
+                position_size_lots=signal.position_size_lots,
+                risk_amount_usd=signal.risk_amount_usd,
+                reward_to_risk=signal.reward_to_risk,
+                strategy_reason=signal.strategy_reason,
+                agent_decision_chain=[m.message_id for m in cycle_messages],
+                outcome=TradeOutcome.OPEN,
+                is_paper=signal.is_paper_trade,
+                notes=f"External webhook signal | cycle={self._cycle_count}",
+            )
+            self._all_trades.append(trade)
+            logger.info(
+                f"[Orchestrator] External signal FILLED: "
+                f"{signal.instrument} {signal.direction.value} "
+                f"@ {trade.entry_price:.5f} | trade_id={trade.trade_id[:8]} "
+                f"{'PAPER' if signal.is_paper_trade else 'LIVE'}"
+            )
+            final_status = "FILLED"
+
+        elif exec_msg.message_type == AgentMessageType.EXECUTION_BLOCKED:
+            final_status = "EXECUTION_BLOCKED"
+        elif exec_msg.message_type == AgentMessageType.ORDER_FAILED:
+            final_status = "ORDER_FAILED"
+
+        messages_emitted = self.ledger.total_messages - ledger_before
+
+        summary = {
+            "status": final_status,
+            "cycle": self._cycle_count,
+            "signal_id": signal.signal_id,
+            "messages_emitted": messages_emitted,
+            "ledger_size": self.ledger.total_messages,
+            "trades_attempted": 1,
+            "trades_executed": trades_executed,
+            "rejection_reasons": rejection_reasons,
+        }
+
+        logger.info(
+            f"[Orchestrator] External signal complete: "
+            f"cycle={self._cycle_count} status={final_status} "
+            f"ledger_size={self.ledger.total_messages}"
+        )
         return summary
 
     def get_agent_health(self) -> Dict[str, dict]:

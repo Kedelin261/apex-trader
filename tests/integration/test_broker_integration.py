@@ -544,16 +544,28 @@ class TestAPIEndpoints:
         assert r.status_code == 400
 
     def test_signal_endpoint_passes_state(self, client):
+        """
+        /api/signal now requires price/stop_loss/take_profit and actually runs
+        the pipeline. Verify the endpoint returns the real processing result
+        with execution_state and routed_to fields present.
+        """
         r = client.post("/api/signal", json={
             "symbol": "XAUUSD",
-            "action": "buy",
+            "action": "BUY",
+            "price": 2300.0,
+            "stop_loss": 2280.0,
+            "take_profit": 2340.0,
             "timeframe": "M15",
+            "schema_version": "1.0",
         })
         assert r.status_code == 200
         data = r.json()
         assert "execution_state" in data
         assert "routed_to" in data
-        assert data["routed_to"] == "PAPER"  # Not connected
+        assert data["routed_to"] == "PAPER"    # Not connected to live broker
+        # Pipeline must have been invoked — status is never the old fake "RECEIVED"
+        assert data["status"] != "RECEIVED"
+        assert "cycle" in data
 
     def test_backtest_runs(self, client):
         r = client.post("/api/backtest/run", json={

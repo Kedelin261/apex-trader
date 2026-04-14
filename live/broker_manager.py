@@ -363,6 +363,39 @@ class BrokerManager:
     def transition_history(self, limit: int = 50) -> List[dict]:
         return self._esm.transition_history(limit)
 
+    # ------------------------------------------------------------------
+    # BROKER INTERFACE PROXIES (used by ExecutionSupervisorAgent)
+    # ------------------------------------------------------------------
+
+    def is_connected(self) -> bool:
+        """Proxy: returns True when a real broker is authenticated."""
+        return self._esm.is_connected()
+
+    def place_order(self, instrument: str, direction: str,
+                    lots: float, stop_loss: float = None,
+                    take_profit: float = None) -> dict:
+        """
+        Legacy-style proxy kept for backward compatibility.
+        ExecutionSupervisorAgent now calls submit_order() directly;
+        this method forwards to it for any legacy callers.
+        """
+        from brokers.base_connector import OrderRequest, OrderSide, OrderType as BrokerOrderType
+        side = OrderSide.BUY if direction.upper() in ("BUY", "LONG") else OrderSide.SELL
+        req = OrderRequest(
+            instrument=instrument,
+            side=side,
+            units=lots,
+            order_type=BrokerOrderType.MARKET,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+        )
+        result = self.submit_order(req)
+        return {
+            "order_id": result.order_id,
+            "fill_price": result.filled_price,
+            "success": result.success,
+        }
+
 
 # ---------------------------------------------------------------------------
 # PAPER BROKER (in-memory fill simulation, used when not in LIVE_ENABLED)

@@ -243,29 +243,194 @@ async def dashboard():
 
 @app.post("/api/signal")
 async def receive_signal(webhook: TradingViewWebhook, request: Request):
-    """TradingView webhook. Routes through agent pipeline."""
-    client_ip = request.client.host
-    log_event("INFO", f"TradingView signal: {webhook.symbol} {webhook.action}", {"ip": client_ip})
+    """
+    TradingView webhook — processes signal through the full agent decision chain.
 
+    Flow:
+      1. Schema validation
+      2. Kill-switch gate
+      3. Build internal Signal domain object from webhook payload
+      4. Call orchestrator.process_external_signal(signal)
+         → StrategyValidator → RiskGuardian → ExecutionSupervisor
+         → paper fill OR live OANDA fill depending on execution state
+      5. Return real result (no fake "queued" language)
+    """
+    from domain.models import (
+        Signal, SignalDirection, StrategyFamily, SessionType,
+        InstrumentType, VenueType, SignalStatus,
+    )
+
+    client_ip = request.client.host if request.client else "unknown"
+    log_event(
+        "INFO",
+        f"TradingView webhook: {webhook.symbol} {webhook.action}",
+        {"ip": client_ip, "schema_version": webhook.schema_version},
+    )
+
+    # ── 1. Schema version guard ────────────────────────────────────────────
     if webhook.schema_version not in ("1.0", "1", None):
-        raise HTTPException(400, "Unsupported schema version")
+        raise HTTPException(400, f"Unsupported schema version: {webhook.schema_version!r}")
 
     orch = get_orchestrator()
     bm = get_broker_manager()
 
+    # ── 2. Kill-switch gate ────────────────────────────────────────────────
     if orch._kill_switch or bm._esm.is_kill_switch_active():
-        return JSONResponse({"status": "REJECTED", "reason": "Kill switch active"}, status_code=403)
+        log_event("WARNING", "Signal rejected — kill switch active",
+                  {"symbol": webhook.symbol})
+        return JSONResponse(
+            {"status": "REJECTED", "reason": "Kill switch active — all trading halted"},
+            status_code=403,
+        )
 
     exec_state = bm._esm.current_state().value
+    is_live = bm._esm.is_live_trading_allowed()
 
+    # ── 3. Map webhook → internal Signal ──────────────────────────────────
+    # Direction
+    action_upper = (webhook.action or "").upper().strip()
+    if action_upper in ("BUY", "LONG"):
+        direction = SignalDirection.BUY
+    elif action_upper in ("SELL", "SHORT"):
+        direction = SignalDirection.SELL
+    else:
+        raise HTTPException(
+            400,
+            f"Invalid action: {webhook.action!r}. Expected BUY/SELL/LONG/SHORT.",
+        )
+
+    # Price fields — require at least entry price
+    entry_price = webhook.price
+    stop_loss = webhook.stop_loss
+    take_profit = webhook.take_profit
+
+    if not entry_price or entry_price <= 0:
+        raise HTTPException(400, "Field 'price' is required and must be > 0")
+    if not stop_loss or stop_loss <= 0:
+        raise HTTPException(400, "Field 'stop_loss' is required and must be > 0")
+    if not take_profit or take_profit <= 0:
+        raise HTTPException(400, "Field 'take_profit' is required and must be > 0")
+
+    # Infer instrument type and venue type from symbol
+    symbol = webhook.symbol.upper().replace("/", "_")
+
+    GOLD_SYMBOLS   = {"XAUUSD", "XAU_USD", "GOLD"}
+    FUTURES_SYMBOLS = {"ES", "NQ", "CL", "GC", "YM"}
+    CRYPTO_PATTERNS = {"BTC", "ETH", "XRP", "LTC"}
+
+    if symbol in GOLD_SYMBOLS:
+        instrument_type = InstrumentType.GOLD
+        venue_type = VenueType.CFD_BROKER
+    elif symbol in FUTURES_SYMBOLS:
+        instrument_type = InstrumentType.FUTURES
+        venue_type = VenueType.FUTURES_EXCHANGE
+    elif any(c in symbol for c in CRYPTO_PATTERNS):
+        instrument_type = InstrumentType.CRYPTO
+        venue_type = VenueType.CRYPTO_EXCHANGE
+    else:
+        instrument_type = InstrumentType.FOREX
+        venue_type = VenueType.FOREX_BROKER
+
+    # Compute stop and target distances in pips
+    pip_size = 0.01 if "JPY" in symbol else (1.0 if symbol in GOLD_SYMBOLS else 0.0001)
+    if pip_size == 0:
+        pip_size = 0.0001
+
+    if direction == SignalDirection.BUY:
+        stop_distance_pips = (entry_price - stop_loss) / pip_size
+        target_distance_pips = (take_profit - entry_price) / pip_size
+    else:
+        stop_distance_pips = (stop_loss - entry_price) / pip_size
+        target_distance_pips = (entry_price - take_profit) / pip_size
+
+    # Clamp to sensible minimums so validator rules have real numbers to work with
+    stop_distance_pips = max(stop_distance_pips, 0.0)
+    target_distance_pips = max(target_distance_pips, 0.0)
+    rr = (target_distance_pips / stop_distance_pips) if stop_distance_pips > 0 else 0.0
+
+    # Position size: risk 1% of account balance, capped at 1 lot for safety
+    account_balance = orch._account_balance
+    risk_pct = CONFIG.get("risk", {}).get("max_risk_per_trade_pct", 1.0) / 100.0
+    risk_usd = account_balance * risk_pct
+
+    pip_value_usd = 10.0  # per standard lot
+    if stop_distance_pips > 0 and pip_value_usd > 0:
+        position_size_lots = round(risk_usd / (stop_distance_pips * pip_value_usd), 2)
+    else:
+        position_size_lots = 0.01
+    position_size_lots = max(0.01, min(position_size_lots, 1.0))
+
+    # Session: derive from current UTC hour
+    now_hour = datetime.now(timezone.utc).hour
+    if 7 <= now_hour < 13:
+        session = SessionType.LONDON
+    elif 13 <= now_hour < 16:
+        session = SessionType.OVERLAP
+    elif 16 <= now_hour < 22:
+        session = SessionType.NEW_YORK
+    elif 0 <= now_hour < 8:
+        session = SessionType.ASIAN
+    else:
+        session = SessionType.OFF_HOURS
+
+    signal = Signal(
+        signal_id=str(__import__("uuid").uuid4()),
+        instrument=symbol,
+        instrument_type=instrument_type,
+        venue_type=venue_type,
+        timeframe=webhook.timeframe or "M15",
+        session=session,
+        direction=direction,
+        status=SignalStatus.CANDIDATE,
+        entry_price=entry_price,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        position_size_lots=position_size_lots,
+        risk_amount_usd=round(risk_usd, 2),
+        reward_to_risk=round(rr, 2),
+        stop_distance_pips=round(stop_distance_pips, 1),
+        target_distance_pips=round(target_distance_pips, 1),
+        strategy_family=StrategyFamily.TJR,
+        strategy_reason=webhook.message or f"TradingView webhook {webhook.strategy or 'TJR'}",
+        confidence_score=0.75,         # Treat external signals as 75% confident
+        is_paper_trade=not is_live,    # True when paper/safe; False only in LIVE_ENABLED
+    )
+
+    # Wire BrokerManager into the execution supervisor so it routes correctly
+    # This is a safe reference injection — no bypass of the ESM gating logic.
+    if orch.execution_supervisor.broker is None:
+        orch.execution_supervisor.broker = bm
+
+    # ── 4. Run through agent pipeline ─────────────────────────────────────
+    result = orch.process_external_signal(signal)
+
+    log_event(
+        "INFO",
+        f"Signal processed: {symbol} {action_upper} → {result['status']}",
+        {
+            "cycle": result["cycle"],
+            "signal_id": result["signal_id"],
+            "execution_state": exec_state,
+            "trades_executed": result["trades_executed"],
+            "rejections": result["rejection_reasons"],
+        },
+    )
+
+    # ── 5. Return real result ──────────────────────────────────────────────
     return {
-        "status": "RECEIVED",
-        "symbol": webhook.symbol,
-        "action": webhook.action,
+        "status": result["status"],
+        "symbol": symbol,
+        "action": action_upper,
+        "signal_id": result["signal_id"],
+        "cycle": result["cycle"],
         "execution_state": exec_state,
-        "routed_to": "LIVE_BROKER" if bm._esm.is_live_trading_allowed() else "PAPER",
+        "routed_to": "LIVE_BROKER" if is_live else "PAPER",
+        "trades_attempted": result["trades_attempted"],
+        "trades_executed": result["trades_executed"],
+        "messages_emitted": result["messages_emitted"],
+        "ledger_size": result["ledger_size"],
+        "rejection_reasons": result["rejection_reasons"],
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "message": "Signal queued for agent pipeline. See /api/ledger.",
     }
 
 
@@ -281,15 +446,26 @@ async def system_status():
         daily = risk_mgr.daily_governor.get_summary()
         snap = bm._esm.snapshot()
 
+        # ── Runtime environment: prefer broker/ESM snapshot over static config ──
+        # snap.environment is the OANDA environment string ("practice" / "live")
+        # when a broker is connected; falls back to config value in pure paper mode.
+        runtime_environment = (
+            snap.environment              # "practice" or "live" from ESM
+            if snap.environment and snap.environment not in ("none", None)
+            else CONFIG.get("system", {}).get("environment", "paper")
+        )
+
         return {
             "system": "Apex Multi-Market TJR Engine",
             "version": "2.0.0",
-            "environment": CONFIG.get("system", {}).get("environment", "paper"),
+            "environment": runtime_environment,
             "uptime_hours": round(uptime, 2),
             "kill_switch_active": orch._kill_switch or snap.kill_switch_active,
             "execution_state": snap.state,
             "broker_connected": bm._esm.is_connected(),
+            "broker": snap.broker or "none",
             "live_trading_armed": snap.live_enabled,
+            "live_trading_allowed": bm._esm.is_live_trading_allowed(),
             "cycle_count": orch._cycle_count,
             "account_balance": round(risk_mgr.account_balance, 2),
             "drawdown_pct": round(risk_mgr.get_drawdown_pct(), 4),

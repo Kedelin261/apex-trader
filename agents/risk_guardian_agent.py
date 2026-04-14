@@ -71,7 +71,7 @@ class RiskGuardianAgent(BaseAgent):
                 target=AgentName.EXECUTION_SUPERVISOR,
                 priority=MessagePriority.HIGH,
                 instrument=signal.instrument,
-                hard_constraints_observed=[
+                hard_constraints=[
                     f"risk_pct={self.risk_manager.max_risk_per_trade_pct}",
                     f"max_daily_loss={self.risk_manager.max_daily_loss_pct}",
                     f"max_drawdown={self.risk_manager.max_total_drawdown_pct}",
@@ -95,7 +95,7 @@ class RiskGuardianAgent(BaseAgent):
                 },
                 priority=MessagePriority.HIGH,
                 instrument=signal.instrument,
-                hard_constraints_observed=[r.value for r in result.rejection_codes],
+                hard_constraints=[r.value for r in result.rejection_codes],
                 final_status="REJECTED",
                 rejection_reasons=result.reasons,
                 parent_message_id=parent_msg_id
