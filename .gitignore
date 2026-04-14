@@ -1,1 +1,29 @@
 .env
+
+# Logs
+logs/
+*.log
+*.jsonl
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyc
+.pytest_cache/
+
+# Runtime state
+execution_state.json
+live_state.json
+
+# Database
+*.db
+*.sqlite
+
+# Node
+node_modules/
+dist/
+.wrangler/
+
+# Environment
+.env
+.dev.vars
