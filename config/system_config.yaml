@@ -1,0 +1,286 @@
+# =============================================================================
+# APEX MULTI-MARKET TJR ENGINE — SYSTEM CONFIGURATION
+# =============================================================================
+# This file is the single source of truth for all system-level configuration.
+# All hard risk rules are enforced in code. This file configures them.
+# =============================================================================
+
+system:
+  name: "Apex Multi-Market TJR Engine"
+  version: "1.0.0"
+  environment: "paper"  # Options: backtest | paper | live
+  log_level: "INFO"
+  timezone: "UTC"
+
+# =============================================================================
+# RISK MANAGEMENT — HARD RULES (non-negotiable)
+# =============================================================================
+risk:
+  max_risk_per_trade_pct: 1.0        # Max % of account per trade
+  max_daily_loss_pct: 3.0            # Hard stop: daily loss
+  max_total_drawdown_pct: 10.0       # Hard stop: total drawdown
+  max_concurrent_trades: 2           # Maximum simultaneous open trades
+  min_reward_to_risk_ratio: 2.0      # Minimum R:R required
+  max_spread_pips: 3.0               # Reject if spread exceeds this
+  max_slippage_pips: 2.0             # Reject or flag if slippage exceeds
+  max_position_size_usd: 10000       # Absolute cap per position
+  account_balance_default: 100000    # Default paper account balance
+
+# =============================================================================
+# TJR STRATEGY ENGINE PARAMETERS
+# =============================================================================
+strategy:
+  tjr:
+    enabled: true
+    timeframes: ["M5", "M15", "M30"]
+    primary_timeframe: "M15"
+    higher_tf_confirmation: "M30"
+    lower_tf_entry: "M5"
+
+    # Structure detection
+    swing_lookback: 20                # Candles to look back for swing H/L
+    min_swing_size_pips: 5            # Minimum pip size for valid swing
+    bos_confirmation_candles: 1       # Candles needed to confirm BOS
+
+    # Liquidity detection
+    equal_level_tolerance_pips: 2.0   # Tolerance for "equal" highs/lows
+    sweep_min_pips_beyond: 1.0        # Minimum pips beyond level for sweep
+
+    # Entry confirmation
+    confirmation_candle_min_body_pct: 0.5   # Min body/range ratio
+    entry_buffer_pips: 1.0            # Buffer above/below entry trigger
+
+    # Stop loss placement
+    sl_buffer_pips: 2.0               # Buffer beyond structure for SL
+    min_sl_pips: 5.0                  # Minimum stop loss distance
+
+    # Sessions (UTC times)
+    sessions:
+      london:
+        start: "07:00"
+        end: "16:00"
+        priority: 1
+      new_york:
+        start: "13:00"
+        end: "22:00"
+        priority: 1
+      overlap:
+        start: "13:00"
+        end: "16:00"
+        priority: 2   # Higher priority = preferred
+      asian:
+        start: "00:00"
+        end: "08:00"
+        priority: 3   # Lower priority
+
+    # Compatible markets for TJR
+    compatible_markets:
+      - FOREX
+      - GOLD
+      - INDICES
+      - FUTURES
+      - COMMODITIES
+
+    # Incompatible for TJR (must use alternative strategies)
+    requires_alternative_strategy:
+      - CRYPTO       # 24/7, different microstructure
+      - PREDICTION   # Binary, different logic entirely
+
+# =============================================================================
+# MARKET CONFIGURATION
+# =============================================================================
+markets:
+  forex:
+    enabled: true
+    default_instruments: ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD", "AUDUSD", "USDCAD"]
+    session_filter: true
+    max_spread_pips: 3.0
+    pip_value_usd: 10.0  # per standard lot per pip
+    min_volume_filter: true
+
+  gold:
+    enabled: true
+    instruments: ["XAUUSD"]
+    pip_size: 0.01
+    contract_size: 100  # oz
+    session_filter: true
+    high_volatility_filter: true
+
+  futures:
+    enabled: true
+    instruments: ["ES", "NQ", "CL", "GC", "YM"]
+    connector: "tradovate"
+    session_filter: true
+    rollover_aware: true
+
+  indices:
+    enabled: true
+    instruments: ["US30", "US500", "NAS100", "GER40", "UK100"]
+    session_filter: true
+
+  stocks:
+    enabled: false    # Requires broker API key
+    instruments: []
+    market_hours: "NYSE"
+
+  crypto:
+    enabled: false    # Enable when exchange credentials provided
+    instruments: ["BTC/USDT", "ETH/USDT"]
+    connector: "ccxt"
+    exchange: "binance"
+    session_filter: false  # 24/7
+
+  commodities:
+    enabled: true
+    instruments: ["USOIL", "UKOIL", "NATGAS"]
+    session_filter: true
+
+  prediction:
+    enabled: false    # Requires Kalshi/prediction market API key
+    instruments: []
+    connector: "kalshi"
+
+# =============================================================================
+# BACKTEST CONFIGURATION
+# =============================================================================
+backtest:
+  default_start: "2023-01-01"
+  default_end: "2024-12-31"
+  initial_balance: 100000
+  slippage_pips: 1.0
+  commission_per_lot_usd: 7.0
+  spread_overhead_pips: 1.0
+  latency_ms: 50
+  data_dir: "data/historical"
+  walk_forward:
+    enabled: true
+    train_periods: 6    # months
+    test_periods: 2     # months
+    min_trades_per_period: 10
+
+# =============================================================================
+# AGENT CONFIGURATION
+# =============================================================================
+agents:
+  enabled: true
+  orchestrator_interval_seconds: 30
+  decision_ledger_path: "logs/agent_decision_ledger.jsonl"
+
+  market_sentinel:
+    enabled: true
+    scan_interval_seconds: 30
+    volatility_spike_atr_multiplier: 3.0
+    spread_spike_multiplier: 3.0
+
+  instrument_selection:
+    enabled: true
+    max_active_instruments: 5
+    min_liquidity_score: 0.6
+    rescan_interval_seconds: 300
+
+  regime_detection:
+    enabled: true
+    adx_trend_threshold: 25.0
+    adx_strong_trend: 40.0
+    volatility_high_atr_pct: 2.0
+
+  strategy_validator:
+    enabled: true
+    min_setup_quality_score: 0.65
+
+  risk_guardian:
+    enabled: true
+    check_interval_seconds: 10
+
+  execution_supervisor:
+    enabled: true
+    max_order_retries: 3
+    retry_delay_seconds: 2
+    circuit_breaker_failures: 5
+
+  optimization:
+    enabled: true
+    mode: "research_only"   # research_only | controlled | disabled
+    walkforward_required: true
+    max_param_combinations: 500
+
+  reporting:
+    enabled: true
+    daily_report_time: "22:00"
+    export_formats: ["json", "csv"]
+
+  cost_control:
+    enabled: true
+    max_daily_ai_calls: 1000
+    prefer_local_models: true
+
+# =============================================================================
+# BROKER / EXCHANGE CONFIGURATION
+# =============================================================================
+brokers:
+  default: "paper"  # paper | tradovate | forex_broker | ccxt
+
+  tradovate:
+    enabled: false
+    environment: "demo"   # demo | live
+    base_url: "https://demo.tradovate.com/v1"
+    websocket_url: "wss://md-demo.tradovateapi.com/v1/websocket"
+
+  forex_broker:
+    enabled: false
+    name: "placeholder"
+    base_url: ""
+
+  ccxt:
+    enabled: false
+    exchange: "binance"
+    testnet: true
+
+  kalshi:
+    enabled: false
+    environment: "demo"
+
+# =============================================================================
+# TRADINGVIEW INTEGRATION
+# =============================================================================
+tradingview:
+  enabled: true
+  webhook_path: "/api/signal"
+  webhook_secret: "CHANGE_ME_IN_ENV"
+  signal_schema_version: "1.0"
+
+# =============================================================================
+# MONITORING & ALERTS
+# =============================================================================
+monitoring:
+  telegram:
+    enabled: false   # Set to true and provide token in .env
+    alert_on_trade: true
+    alert_on_risk_event: true
+    alert_on_daily_summary: true
+    alert_on_error: true
+
+  dashboard:
+    enabled: true
+    host: "0.0.0.0"
+    port: 8080
+    refresh_interval_seconds: 5
+
+# =============================================================================
+# DATABASE
+# =============================================================================
+database:
+  type: "sqlite"   # sqlite | postgresql
+  sqlite_path: "data/apex_trader.db"
+  # postgresql_url: "postgresql://user:pass@localhost:5432/apex"
+
+# =============================================================================
+# NEWS / ECONOMIC CALENDAR FILTER
+# =============================================================================
+news_filter:
+  enabled: true
+  block_minutes_before: 30
+  block_minutes_after: 30
+  impact_levels: ["HIGH"]   # Block on HIGH impact only, or add "MEDIUM"
+  source: "forexfactory"    # forexfactory | investing | manual
+  calendar_file: "data/economic_calendar.json"

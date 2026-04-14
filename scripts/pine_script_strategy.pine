@@ -1,0 +1,297 @@
+//@version=5
+// =============================================================================
+// APEX MULTI-MARKET TJR ENGINE — Pine Script Mirror Strategy
+// Version: 1.0.0
+//
+// PURPOSE: Mirror the deterministic TJR backend logic as closely as possible
+// in Pine Script for visual confirmation and webhook alert generation.
+//
+// This script generates alerts that fire webhooks to /api/signal
+// TradingView is an INPUT SOURCE, not the sole source of truth.
+// All signals must pass the backend agent pipeline.
+//
+// WEBHOOK PAYLOAD SCHEMA v1.0:
+// {
+//   "symbol": "{{ticker}}",
+//   "action": "{{strategy.order.action}}",
+//   "price": {{close}},
+//   "stop_loss": <calculated_sl>,
+//   "take_profit": <calculated_tp>,
+//   "timeframe": "{{interval}}",
+//   "strategy": "TJR",
+//   "message": "{{strategy.order.comment}}",
+//   "schema_version": "1.0"
+// }
+// =============================================================================
+
+strategy(
+    title="Apex TJR Strategy",
+    shorttitle="APEX-TJR",
+    overlay=true,
+    pyramiding=0,
+    default_qty_type=strategy.percent_of_equity,
+    default_qty_value=1,
+    commission_type=strategy.commission.cash_per_contract,
+    commission_value=7,
+    slippage=2,
+    currency=currency.USD,
+    initial_capital=100000
+)
+
+// =============================================================================
+// INPUTS
+// =============================================================================
+group_structure = "Market Structure"
+swing_lookback     = input.int(5, "Swing Lookback", minval=2, maxval=20, group=group_structure)
+min_swing_pips     = input.float(5.0, "Min Swing Size (pips)", group=group_structure)
+
+group_liquidity = "Liquidity & BOS"
+eq_tolerance       = input.float(2.0, "Equal Level Tolerance (pips)", group=group_liquidity)
+sweep_min_pips_val = input.float(1.0, "Min Sweep Extension (pips)", group=group_liquidity)
+bos_min_body_pct   = input.float(0.50, "BOS Min Body Ratio", minval=0.3, maxval=1.0, group=group_liquidity)
+
+group_entry = "Entry Logic"
+entry_buffer       = input.float(1.0, "Entry Buffer (pips)", group=group_entry)
+sl_buffer          = input.float(2.0, "SL Buffer (pips)", group=group_entry)
+min_rr             = input.float(2.0, "Minimum R:R", minval=1.0, maxval=5.0, group=group_entry)
+min_body_ratio     = input.float(0.50, "Conf. Candle Min Body %", group=group_entry)
+
+group_session = "Session Filter"
+use_session_filter = input.bool(true, "Enable Session Filter", group=group_session)
+use_london         = input.bool(true, "Trade London Session", group=group_session)
+use_newyork        = input.bool(true, "Trade New York Session", group=group_session)
+use_overlap        = input.bool(true, "Trade Overlap Session", group=group_session)
+
+group_risk = "Risk / Display"
+show_swing_points  = input.bool(true, "Show Swing Points", group=group_risk)
+show_liq_levels    = input.bool(true, "Show Liquidity Levels", group=group_risk)
+show_structure     = input.bool(true, "Show Structure Labels", group=group_risk)
+
+group_webhook = "Webhook"
+webhook_url        = input.string("https://your-apex-server.com/api/signal", "Webhook URL", group=group_webhook)
+
+// =============================================================================
+// PIP SIZE HELPER
+// =============================================================================
+pip_mult = syminfo.mintick * 10
+
+// =============================================================================
+// SESSION CLASSIFICATION
+// =============================================================================
+is_london  = (time(timeframe.period, "0700-1600", "UTC"))
+is_newyork = (time(timeframe.period, "1300-2200", "UTC"))
+is_overlap = (time(timeframe.period, "1300-1600", "UTC"))
+
+is_active_session = switch
+    use_overlap and is_overlap => true
+    use_london  and is_london  => true
+    use_newyork and is_newyork => true
+    => false
+
+session_label = is_overlap ? "OVERLAP" : is_london ? "LONDON" : is_newyork ? "NEW_YORK" : "OFF_HOURS"
+
+// =============================================================================
+// SWING POINT DETECTION
+// =============================================================================
+swing_high = ta.pivothigh(high, swing_lookback, swing_lookback)
+swing_low  = ta.pivotlow(low, swing_lookback, swing_lookback)
+
+// Store recent confirmed swing points
+var float last_sh  = na
+var float prev_sh  = na
+var float last_sl  = na
+var float prev_sl  = na
+
+if not na(swing_high)
+    prev_sh := last_sh
+    last_sh := swing_high[swing_lookback]
+
+if not na(swing_low)
+    prev_sl := last_sl
+    last_sl := swing_low[swing_lookback]
+
+// =============================================================================
+// MARKET STRUCTURE: HIGHER HIGHS / HIGHER LOWS / LOWER HIGHS / LOWER LOWS
+// =============================================================================
+bool is_bullish_structure = false
+bool is_bearish_structure = false
+
+if not na(last_sh) and not na(prev_sh) and not na(last_sl) and not na(prev_sl)
+    hh = last_sh > prev_sh
+    hl = last_sl > prev_sl
+    lh = last_sh < prev_sh
+    ll = last_sl < prev_sl
+    is_bullish_structure := hh and hl
+    is_bearish_structure := lh and ll
+
+// =============================================================================
+// BREAK OF STRUCTURE (BOS)
+// =============================================================================
+float body_size = math.abs(close - open)
+float range_size = high - low
+float body_ratio = range_size > 0 ? body_size / range_size : 0.0
+
+bool bos_bullish = not na(last_sh) and close > last_sh and body_ratio >= bos_min_body_pct
+bool bos_bearish = not na(last_sl) and close < last_sl and body_ratio >= bos_min_body_pct
+
+var bool had_bos_bullish = false
+var bool had_bos_bearish = false
+if bos_bullish
+    had_bos_bullish := true
+    had_bos_bearish := false
+if bos_bearish
+    had_bos_bearish := true
+    had_bos_bullish := false
+
+// =============================================================================
+// ENTRY CONDITIONS
+// =============================================================================
+// Confirmation candle: body ratio meets minimum, direction aligns with structure
+bool conf_bull = close > open and body_ratio >= min_body_ratio
+bool conf_bear = close < open and body_ratio >= min_body_ratio
+
+// Direction: structure defines bias
+// BUY: bullish structure + (BOS bullish OR liquidity sweep) + bullish confirmation candle
+// SELL: bearish structure + (BOS bearish) + bearish confirmation candle
+
+bool buy_signal  = is_bullish_structure and had_bos_bullish and conf_bull
+bool sell_signal = is_bearish_structure and had_bos_bearish and conf_bear
+
+// Session filter
+if use_session_filter
+    buy_signal  := buy_signal and is_active_session
+    sell_signal := sell_signal and is_active_session
+
+// =============================================================================
+// ENTRY, STOP LOSS, TAKE PROFIT
+// =============================================================================
+pip = pip_mult
+
+float buy_entry  = high + (entry_buffer * pip)
+float buy_sl     = not na(last_sl) ? last_sl - (sl_buffer * pip) : low - (sl_buffer * pip) * 5
+float buy_rr_min = buy_entry - buy_sl > 0 ? buy_entry + (buy_entry - buy_sl) * min_rr : na
+float buy_tp     = buy_rr_min
+
+float sell_entry = low - (entry_buffer * pip)
+float sell_sl    = not na(last_sh) ? last_sh + (sl_buffer * pip) : high + (sl_buffer * pip) * 5
+float sell_rr_min = sell_sl - sell_entry > 0 ? sell_entry - (sell_sl - sell_entry) * min_rr : na
+float sell_tp    = sell_rr_min
+
+// =============================================================================
+// R:R FILTER
+// =============================================================================
+float buy_rr  = not na(buy_sl)  and buy_entry  - buy_sl  > 0 ? (buy_tp  - buy_entry)  / (buy_entry  - buy_sl)  : 0.0
+float sell_rr = not na(sell_sl) and sell_sl - sell_entry > 0 ? (sell_entry - sell_tp) / (sell_sl - sell_entry) : 0.0
+
+bool buy_rr_ok  = buy_rr  >= min_rr
+bool sell_rr_ok = sell_rr >= min_rr
+
+buy_signal  := buy_signal  and buy_rr_ok
+sell_signal := sell_signal and sell_rr_ok
+
+// =============================================================================
+// STRATEGY ENTRY / EXIT
+// =============================================================================
+if buy_signal and strategy.opentrades == 0
+    strategy.entry("TJR_BUY", strategy.long, stop=buy_entry,
+                   comment="TJR_BUY|" + session_label + "|BOS:" + str.tostring(had_bos_bullish))
+    strategy.exit("TJR_BUY_EXIT", "TJR_BUY",
+                  stop=buy_sl, limit=buy_tp)
+
+if sell_signal and strategy.opentrades == 0
+    strategy.entry("TJR_SELL", strategy.short, stop=sell_entry,
+                   comment="TJR_SELL|" + session_label + "|BOS:" + str.tostring(had_bos_bearish))
+    strategy.exit("TJR_SELL_EXIT", "TJR_SELL",
+                  stop=sell_sl, limit=sell_tp)
+
+// =============================================================================
+// ALERTS — Webhook payloads to /api/signal
+// =============================================================================
+buy_alert_msg = '{"symbol":"' + syminfo.ticker +
+    '","action":"buy"' +
+    ',"price":' + str.tostring(close) +
+    ',"stop_loss":' + str.tostring(math.round(buy_sl, 5)) +
+    ',"take_profit":' + str.tostring(math.round(buy_tp, 5)) +
+    ',"timeframe":"' + timeframe.period + '"' +
+    ',"strategy":"TJR"' +
+    ',"message":"BUY|' + session_label + '|BOS=' + str.tostring(had_bos_bullish) +
+    '|RR=' + str.tostring(math.round(buy_rr, 2)) + '"' +
+    ',"schema_version":"1.0"}'
+
+sell_alert_msg = '{"symbol":"' + syminfo.ticker +
+    '","action":"sell"' +
+    ',"price":' + str.tostring(close) +
+    ',"stop_loss":' + str.tostring(math.round(sell_sl, 5)) +
+    ',"take_profit":' + str.tostring(math.round(sell_tp, 5)) +
+    ',"timeframe":"' + timeframe.period + '"' +
+    ',"strategy":"TJR"' +
+    ',"message":"SELL|' + session_label + '|BOS=' + str.tostring(had_bos_bearish) +
+    '|RR=' + str.tostring(math.round(sell_rr, 2)) + '"' +
+    ',"schema_version":"1.0"}'
+
+alertcondition(buy_signal,  title="TJR BUY Signal",  message=buy_alert_msg)
+alertcondition(sell_signal, title="TJR SELL Signal", message=sell_alert_msg)
+
+// =============================================================================
+// VISUAL ELEMENTS
+// =============================================================================
+// Swing highs and lows
+plotshape(show_swing_points and not na(swing_high),
+    style=shape.triangledown, color=color.red, size=size.small,
+    title="Swing High", location=location.abovebar)
+
+plotshape(show_swing_points and not na(swing_low),
+    style=shape.triangleup, color=color.green, size=size.small,
+    title="Swing Low", location=location.belowbar)
+
+// Structure state label
+if show_structure and barstate.isrealtime
+    if is_bullish_structure
+        label.new(bar_index, high, "BULL", color=color.new(color.green, 70),
+                  textcolor=color.white, size=size.tiny)
+    else if is_bearish_structure
+        label.new(bar_index, high, "BEAR", color=color.new(color.red, 70),
+                  textcolor=color.white, size=size.tiny)
+
+// BOS labels
+if show_liq_levels and bos_bullish
+    label.new(bar_index, low, "BOS ▲", color=color.new(color.blue, 60),
+              textcolor=color.white, style=label.style_label_up, size=size.tiny)
+
+if show_liq_levels and bos_bearish
+    label.new(bar_index, high, "BOS ▼", color=color.new(color.orange, 60),
+              textcolor=color.white, style=label.style_label_down, size=size.tiny)
+
+// Buy/sell signal arrows
+plotshape(buy_signal,  title="BUY Entry",  style=shape.arrowup,
+    location=location.belowbar, color=color.lime, size=size.normal)
+plotshape(sell_signal, title="SELL Entry", style=shape.arrowdown,
+    location=location.abovebar, color=color.red,  size=size.normal)
+
+// Session background shading
+bgcolor(is_overlap ? color.new(color.yellow, 95) :
+        is_london  ? color.new(color.blue, 97)   :
+        is_newyork ? color.new(color.purple, 97) : na,
+    title="Session Shading")
+
+// Info panel
+var table info_table = table.new(position.top_right, 2, 6,
+    bgcolor=color.new(color.black, 60), border_width=1)
+
+if barstate.islast
+    table.cell(info_table, 0, 0, "APEX TJR", text_color=color.blue, text_size=size.small, bgcolor=color.new(color.navy, 50))
+    table.cell(info_table, 1, 0, "v1.0.0", text_color=color.gray, text_size=size.small)
+    table.cell(info_table, 0, 1, "Structure", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 1, is_bullish_structure ? "BULLISH" : is_bearish_structure ? "BEARISH" : "NEUTRAL",
+        text_color=is_bullish_structure ? color.green : is_bearish_structure ? color.red : color.gray, text_size=size.tiny)
+    table.cell(info_table, 0, 2, "Session", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 2, session_label,
+        text_color=is_active_session ? color.green : color.red, text_size=size.tiny)
+    table.cell(info_table, 0, 3, "BOS Bull", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 3, str.tostring(had_bos_bullish),
+        text_color=had_bos_bullish ? color.green : color.gray, text_size=size.tiny)
+    table.cell(info_table, 0, 4, "BOS Bear", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 4, str.tostring(had_bos_bearish),
+        text_color=had_bos_bearish ? color.red : color.gray, text_size=size.tiny)
+    table.cell(info_table, 0, 5, "Min R:R", text_color=color.gray, text_size=size.tiny)
+    table.cell(info_table, 1, 5, str.tostring(min_rr) + ":1", text_color=color.white, text_size=size.tiny)
