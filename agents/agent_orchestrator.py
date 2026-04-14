@@ -32,6 +32,7 @@ from domain.models import (
     Signal, TJRSetup, Position, Trade, InstrumentType, VenueType,
     EnvironmentMode, StrategyHealthState, TradeOutcome
 )
+from domain.symbol_utils import normalize_symbol
 from core.tjr_strategy_engine import TJRStrategyEngine
 from data.market_data_service import MarketDataService
 from protocol.agent_protocol import (
@@ -411,6 +412,17 @@ class AgentOrchestrator:
                 "trades_executed": 0,
                 "rejection_reasons": ["Kill switch is active — all trading halted"],
             }
+
+        # ── Normalise symbol to canonical format ───────────────────────────
+        # Ensures XAU_USD, xau/usd, GOLD etc. all become XAUUSD inside the pipeline.
+        canonical = normalize_symbol(signal.instrument)
+        if canonical != signal.instrument:
+            logger.info(
+                f"[Orchestrator] Symbol normalised: {signal.instrument!r} → {canonical!r} "
+                f"(signal_id={signal.signal_id})"
+            )
+            # Use Pydantic model_copy so the immutable model is not mutated directly
+            signal = signal.model_copy(update={"instrument": canonical})
 
         # ── Increment cycle counter ─────────────────────────────────────────
         self._cycle_count += 1

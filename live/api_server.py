@@ -64,6 +64,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from domain.models import InstrumentType, VenueType, EnvironmentMode
+from domain.symbol_utils import normalize_symbol, is_known_symbol
 from data.market_data_service import MarketDataService
 from backtest.backtest_engine import BacktestEngine
 from agents.agent_orchestrator import AgentOrchestrator
@@ -311,22 +312,80 @@ async def receive_signal(webhook: TradingViewWebhook, request: Request):
     if not take_profit or take_profit <= 0:
         raise HTTPException(400, "Field 'take_profit' is required and must be > 0")
 
-    # Infer instrument type and venue type from symbol
-    symbol = webhook.symbol.upper().replace("/", "_")
+    # 3a. Canonicalise incoming symbol (XAU_USD / xau/usd / GOLD → XAUUSD)
+    raw_symbol = webhook.symbol
+    symbol = normalize_symbol(raw_symbol)
 
-    GOLD_SYMBOLS   = {"XAUUSD", "XAU_USD", "GOLD"}
+    # Diagnostic logging for XAUUSD
+    if symbol == "XAUUSD":
+        logger.info(
+            f"[API/signal] XAUUSD diagnostic: "
+            f"raw={raw_symbol!r} canonical={symbol!r} "
+            f"action={action_upper} entry={entry_price} "
+            f"sl={stop_loss} tp={take_profit}"
+        )
+
+    # 3b. Pre-submit tradeability check (Intent Layer gate)
+    tradeability = bm.check_symbol(symbol)
+
+    if symbol == "XAUUSD":
+        logger.info(
+            f"[API/signal] XAUUSD tradeability: "
+            f"broker_sym={tradeability.broker_symbol!r} "
+            f"asset_class={tradeability.asset_class!r} "
+            f"is_tradeable={tradeability.is_tradeable} "
+            f"rejection_code={tradeability.rejection_code!r}"
+        )
+
+    # Hard-block only when broker is connected AND instrument is not tradeable.
+    # In pure PAPER_MODE (no broker) we allow through for testing.
+    broker_connected = bm._esm.is_connected()
+    if broker_connected and not tradeability.is_tradeable:
+        log_event(
+            "WARNING",
+            f"Signal rejected — instrument not tradeable: {symbol}",
+            tradeability.to_dict(),
+        )
+        return JSONResponse(
+            {
+                "status": "REJECTED",
+                "reason": tradeability.reason_if_not_tradeable or "Instrument not tradeable",
+                "rejection_code": tradeability.rejection_code,
+                "canonical_symbol": symbol,
+                "broker_symbol": tradeability.broker_symbol,
+            },
+            status_code=422,
+        )
+
+    # 3c. Infer instrument type and venue type from canonical symbol
+    GOLD_SYMBOLS    = {"XAUUSD", "XAGUSD"}
     FUTURES_SYMBOLS = {"ES", "NQ", "CL", "GC", "YM"}
-    CRYPTO_PATTERNS = {"BTC", "ETH", "XRP", "LTC"}
+    CRYPTO_SYMBOLS  = {"BTCUSD", "ETHUSD", "XRPUSD", "LTCUSD"}
+    INDEX_SYMBOLS   = {"US30", "US500", "NAS100", "GER40", "UK100"}
+    OIL_SYMBOLS     = {"USOIL", "UKOIL"}
 
-    if symbol in GOLD_SYMBOLS:
+    # Prefer asset_class from mapper if available
+    if tradeability.asset_class == "GOLD":
+        instrument_type = InstrumentType.GOLD
+        venue_type = VenueType.CFD_BROKER
+    elif tradeability.asset_class in ("INDEX",):
+        instrument_type = InstrumentType.INDICES
+        venue_type = VenueType.CFD_BROKER
+    elif tradeability.asset_class in ("OIL", "METALS"):
+        instrument_type = InstrumentType.COMMODITIES
+        venue_type = VenueType.CFD_BROKER
+    elif symbol in GOLD_SYMBOLS:
         instrument_type = InstrumentType.GOLD
         venue_type = VenueType.CFD_BROKER
     elif symbol in FUTURES_SYMBOLS:
         instrument_type = InstrumentType.FUTURES
         venue_type = VenueType.FUTURES_EXCHANGE
-    elif any(c in symbol for c in CRYPTO_PATTERNS):
+    elif symbol in CRYPTO_SYMBOLS:
         instrument_type = InstrumentType.CRYPTO
         venue_type = VenueType.CRYPTO_EXCHANGE
+    elif symbol in INDEX_SYMBOLS or symbol in OIL_SYMBOLS:
+        instrument_type = InstrumentType.INDICES
+        venue_type = VenueType.CFD_BROKER
     else:
         instrument_type = InstrumentType.FOREX
         venue_type = VenueType.FOREX_BROKER
@@ -570,6 +629,29 @@ async def get_ledger(limit: int = 50, msg_type: Optional[str] = None):
         }
     except Exception as e:
         return {"error": str(e), "messages": []}
+
+
+@app.get("/api/broker/capability-cache")
+async def broker_capability_cache():
+    """
+    Return the symbol capability cache hydrated on broker connect.
+    Shows canonical_symbol, broker_symbol, asset_class, is_supported,
+    is_tradeable, rejection_code for every known instrument.
+    """
+    try:
+        bm = get_broker_manager()
+        return {
+            "broker": bm._broker_name or "none",
+            "hydrated": bm._symbol_mapper.is_hydrated if bm._symbol_mapper else False,
+            "hydrated_at": (
+                bm._symbol_mapper.hydrated_at.isoformat()
+                if bm._symbol_mapper and bm._symbol_mapper.hydrated_at
+                else None
+            ),
+            "instruments": bm.get_capability_cache(),
+        }
+    except Exception as e:
+        return {"error": str(e), "instruments": []}
 
 
 @app.get("/api/positions")

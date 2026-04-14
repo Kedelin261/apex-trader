@@ -7,7 +7,9 @@ Responsibilities:
   - Instantiate the correct connector (OANDA, paper, etc.)
   - Own the ExecutionStateMachine
   - Own the PreflightService and ReconciliationService
+  - Own the BrokerSymbolMapper (hydrated on connect; used for pre-submit validation)
   - Route signals: LIVE_ENABLED → real broker | otherwise → paper
+  - Pre-submit tradeability validation via check_symbol() before any order
   - Expose status, account, balances, positions, orders for API
   - Handle order rejections and record history
 """
@@ -25,6 +27,7 @@ from brokers.base_connector import (
     InstrumentMapping, OrderRequest, OrderResult, OrderSide, OrderType,
     PermissionsCheck, PreflightResult, ReconciliationResult,
 )
+from brokers.symbol_mapper import BrokerSymbolMapper, TradeabilityResult
 from live.execution_state_machine import ExecutionState, ExecutionStateMachine
 
 logger = logging.getLogger(__name__)
@@ -61,6 +64,9 @@ class BrokerManager:
 
         # Paper broker fallback
         self._paper_broker = PaperBroker()
+
+        # Symbol mapper (hydrated after broker connect)
+        self._symbol_mapper: Optional[BrokerSymbolMapper] = None
 
         # Rejection history
         self._rejection_history: List[dict] = []
@@ -99,6 +105,20 @@ class BrokerManager:
 
         # Run preflight
         preflight = self._run_preflight_internal(operator)
+
+        # Hydrate symbol mapper so pre-submit validation has live capability data
+        self._symbol_mapper = BrokerSymbolMapper(broker)
+        try:
+            self._symbol_mapper.hydrate(self._connector)
+            logger.info(
+                f"[BrokerManager] Symbol mapper hydrated for broker '{broker}' — "
+                f"{len(self._symbol_mapper._cache)} instruments cached"
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[BrokerManager] Symbol mapper hydration failed: {exc}. "
+                "Falling back to static map on first check()."
+            )
 
         # Build services
         if self._orchestrator and self._risk_manager:
@@ -295,6 +315,63 @@ class BrokerManager:
         if self._connector:
             return self._connector.validate_instrument_mapping(symbol)
         return None
+
+    # ------------------------------------------------------------------
+    # SYMBOL TRADEABILITY CHECK  (Intent Layer pre-submit gate)
+    # ------------------------------------------------------------------
+
+    def check_symbol(self, canonical_symbol: str) -> TradeabilityResult:
+        """
+        Pre-submit tradeability check for *canonical_symbol*.
+
+        Always call this before building an Order.  If is_tradeable is
+        False the caller must emit a SIGNAL_REJECTED / EXECUTION_BLOCKED
+        ledger message with rejection_code as the reason — never attempt
+        to submit the order.
+
+        Diagnostic logging:
+          - INFO for XAUUSD (visibility into gold flow)
+          - DEBUG for other symbols
+          - WARNING for any non-tradeable result
+        """
+        connected = self._esm.is_connected()
+
+        if self._symbol_mapper is None:
+            # Mapper not yet created (broker never connected)
+            result = TradeabilityResult(
+                canonical_symbol=canonical_symbol,
+                broker_symbol=None,
+                asset_class=None,
+                is_supported=False,
+                is_tradeable=False,
+                reason_if_not_tradeable="Broker not connected — no symbol mapper available",
+                rejection_code="BROKER_NOT_CONNECTED",
+            )
+        else:
+            result = self._symbol_mapper.check(canonical_symbol, connector_connected=connected)
+
+        # Diagnostic logging
+        log_fn = logger.info if canonical_symbol == "XAUUSD" else logger.debug
+        log_fn(
+            f"[BrokerManager.check_symbol] canonical={canonical_symbol!r} "
+            f"broker_sym={result.broker_symbol!r} "
+            f"asset_class={result.asset_class!r} "
+            f"is_supported={result.is_supported} "
+            f"is_tradeable={result.is_tradeable} "
+            f"rejection_code={result.rejection_code!r}"
+        )
+        if not result.is_tradeable:
+            logger.warning(
+                f"[BrokerManager.check_symbol] REJECTED {canonical_symbol!r}: "
+                f"{result.rejection_code} — {result.reason_if_not_tradeable}"
+            )
+        return result
+
+    def get_capability_cache(self) -> list:
+        """Return the full symbol capability cache as a list of dicts."""
+        if self._symbol_mapper:
+            return self._symbol_mapper.dump_cache()
+        return []
 
     # ------------------------------------------------------------------
     # RECONCILIATION
