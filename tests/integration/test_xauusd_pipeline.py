@@ -209,8 +209,16 @@ class TestBrokerManagerCheckSymbol:
         assert result.rejection_code == "BROKER_NOT_CONNECTED"
 
     def test_check_xauusd_with_mapper_hydrated(self):
-        """With symbol mapper hydrated (no live connector), XAUUSD is tradeable."""
+        """
+        v2.3: With symbol mapper hydrated WITHOUT a live connector, XAUUSD is
+        INSTRUMENT_UNCONFIRMED (not tradeable=True). This is the correct behaviour —
+        the old test expected tradeable=True which was the root-cause bug.
+
+        To get is_tradeable=True, hydrate() must be called with a connected connector
+        that returns is_supported=True from the live /instruments endpoint.
+        """
         from brokers.symbol_mapper import BrokerSymbolMapper
+        from brokers.base_connector import InstrumentMapping
         from live.broker_manager import BrokerManager
         from unittest.mock import patch, MagicMock
 
@@ -224,16 +232,38 @@ class TestBrokerManagerCheckSymbol:
             mock_esm_cls.return_value = mock_esm
 
             bm = BrokerManager(config={})
-            # Manually hydrate mapper
+
+            # --- Scenario A: hydrate with no connector → INSTRUMENT_UNCONFIRMED ---
             bm._symbol_mapper = BrokerSymbolMapper("oanda")
             bm._symbol_mapper.hydrate(connector=None)
+            result_no_conn = bm.check_symbol("XAUUSD")
+            assert result_no_conn.is_tradeable is False
+            assert result_no_conn.rejection_code == "INSTRUMENT_UNCONFIRMED"
 
-            result = bm.check_symbol("XAUUSD")
+            # --- Scenario B: hydrate with live-confirmed connector → tradeable=True ---
+            mock_live_conn = MagicMock()
+            mock_live_conn.validate_instrument_mapping.return_value = InstrumentMapping(
+                internal="XAUUSD",
+                broker_symbol="XAU_USD",
+                tradeable=True,
+                min_units=1.0,
+                max_units=10000.0,
+                precision=2,
+                margin_rate=0.05,
+                spread_typical=0.0,
+                is_mapped=True,
+                is_supported=True,
+                is_tradeable_metadata=True,
+                raw_broker_metadata={"status": "tradeable"},
+            )
+            bm._symbol_mapper = BrokerSymbolMapper("oanda")
+            bm._symbol_mapper.hydrate(connector=mock_live_conn)
+            result_live = bm.check_symbol("XAUUSD")
 
-        assert result.is_tradeable is True
-        assert result.broker_symbol == "XAU_USD"
-        assert result.asset_class == "GOLD"
-        assert result.rejection_code is None
+        assert result_live.is_tradeable is True
+        assert result_live.broker_symbol == "XAU_USD"
+        assert result_live.asset_class == "GOLD"
+        assert result_live.rejection_code is None
 
     def test_check_unknown_symbol(self):
         """Unknown symbols return UNKNOWN_SYMBOL."""

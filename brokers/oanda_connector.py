@@ -1,26 +1,37 @@
 """
 APEX MULTI-MARKET TJR ENGINE
-OANDA v20 REST API Connector — Full production implementation.
+OANDA v20 REST API Connector — Full production implementation (v2.3).
+
+Changes in v2.3:
+  - validate_instrument_mapping now populates granular capability flags
+    (is_mapped, is_supported, is_tradeable_metadata) and never returns
+    optimistically tradeable=True from the static fallback alone.
+  - submit_order preserves full raw broker error, parsed_error_code, and
+    normalized_rejection_code in every OrderResult and rejection history entry.
+  - Gold (XAU_USD) payload audit:
+      * Units are in troy ounces (not lots). 1 unit = 1 oz.
+      * Minimum order size: 1 oz for XAU_USD on OANDA.
+      * Lots→ounces conversion: 1 standard lot ≈ 100 oz.
+      * SL/TP minimum distance for gold: 1 pip = $1 (1 USD per oz).
+  - Pre-submit payload validation (_validate_gold_payload) checks units,
+    precision, and SL/TP minimum distance before submission.
+  - Structured diagnostics dict returned in rejection history.
 
 Supported operations:
-  - authenticate()             Validate token against OANDA /accounts endpoint
-  - is_connected()             Check live session state
-  - get_account_info()         Fetch full account summary
-  - get_balances()             Extract balances from account summary
-  - get_permissions()          Derive permissions from account properties
-  - get_positions()            Fetch all open positions
-  - get_open_orders()          Fetch all pending orders
-  - validate_instrument_mapping(symbol)
-  - submit_order(request)      Market/limit orders with SL/TP
-  - cancel_order(order_id)     Cancel pending order
-  - get_order_status(order_id) Fetch order by ID
-  - reconcile_state(internal)  Compare vs broker
-  - run_preflight_checks()     Full pre-live validation
-
-OANDA environments:
-  practice → https://api-fxtrade.oanda.com/v3   (practice accounts)
-  live      → https://api-fxtrade.oanda.com/v3   (live accounts)
-  Note: Both use same REST URL; streaming differs but we use REST here.
+  - authenticate()
+  - is_connected()
+  - get_account_info()
+  - get_balances()
+  - get_permissions()
+  - get_positions()
+  - get_open_orders()
+  - validate_instrument_mapping(symbol)  — granular capability flags
+  - submit_order(request)               — with gold payload validation
+  - cancel_order(order_id)
+  - get_order_status(order_id)
+  - reconcile_state(internal)
+  - run_preflight_checks()
+  - validate_xau_payload(request)       — dry-run XAU payload check (no order)
 
 SECURITY: Token is NEVER logged. All log statements use mask().
 """
@@ -82,10 +93,78 @@ REVERSE_MAP = {v: k for k, v in OANDA_INSTRUMENT_MAP.items()}
 OANDA_PRECISION: Dict[str, int] = {
     "EUR_USD": 5, "GBP_USD": 5, "USD_JPY": 3, "AUD_USD": 5,
     "USD_CAD": 5, "USD_CHF": 5, "NZD_USD": 5, "EUR_GBP": 5,
-    "EUR_JPY": 3, "GBP_JPY": 3, "XAU_USD": 3, "XAG_USD": 4,
+    "EUR_JPY": 3, "GBP_JPY": 3, "XAU_USD": 2, "XAG_USD": 4,
     "WTICO_USD": 3, "BCO_USD": 3, "US30_USD": 1, "SPX500_USD": 1,
     "NAS100_USD": 1, "DE30_EUR": 1, "UK100_GBP": 1,
 }
+
+# ---------------------------------------------------------------------------
+# GOLD-SPECIFIC CONSTANTS
+# OANDA XAU_USD trades in troy ounces.
+#   1 standard lot (FX convention) = 100 oz for gold.
+#   Minimum order: 1 oz.
+#   Maximum order: 10,000 oz (per OANDA documentation).
+#   SL/TP minimum distance: ~$1 per oz (1 price unit).
+# ---------------------------------------------------------------------------
+
+GOLD_INSTRUMENTS = {"XAU_USD", "XAG_USD"}
+
+# Lot-to-unit multipliers for instruments that use non-FX unit conventions
+LOT_UNIT_MULTIPLIER: Dict[str, float] = {
+    "XAU_USD":   100.0,   # 1 standard lot = 100 troy oz
+    "XAG_USD":   5000.0,  # 1 standard lot = 5000 troy oz (OANDA convention)
+    "WTICO_USD": 1000.0,  # 1 lot = 1000 barrels
+    "BCO_USD":   1000.0,
+}
+
+# Minimum SL/TP distance (in price units) for instruments
+MIN_SLTP_DISTANCE: Dict[str, float] = {
+    "XAU_USD": 1.0,    # $1 per oz minimum
+    "XAG_USD": 0.10,
+}
+
+# OANDA error codes that map to our normalized rejection codes
+_OANDA_ERROR_MAP: Dict[str, str] = {
+    "INSTRUMENT_NOT_TRADEABLE":                  "INSTRUMENT_NOT_TRADEABLE",
+    "INSTRUMENT_HALTED":                         "INSTRUMENT_NOT_TRADEABLE",
+    "MARKET_HALTED":                             "INSTRUMENT_NOT_TRADEABLE",
+    "ACCOUNT_NOT_TRADEABLE_ON_INSTRUMENT":       "BROKER_DOES_NOT_SUPPORT_INSTRUMENT",
+    "INSTRUMENT_NOT_IN_LIST_OF_TRADEABLE_INSTRUMENTS": "BROKER_DOES_NOT_SUPPORT_INSTRUMENT",
+    "TRADE_DOESN_T_EXIST":                       "ORDER_NOT_FOUND",
+    "UNITS_MINIMUM_NOT_MET":                     "GOLD_UNITS_TOO_SMALL",
+    "UNITS_MAXIMUM_EXCEEDED":                    "GOLD_UNITS_TOO_LARGE",
+    "STOP_LOSS_ON_FILL_PRICE_MISSING":           "GOLD_SLTP_MISSING",
+    "STOP_LOSS_ON_FILL_PRICE_INVALID":           "GOLD_SLTP_INVALID",
+    "TAKE_PROFIT_ON_FILL_PRICE_MISSING":         "GOLD_SLTP_MISSING",
+    "TAKE_PROFIT_ON_FILL_PRICE_INVALID":         "GOLD_SLTP_INVALID",
+    "STOP_LOSS_ON_FILL_LOSS":                    "GOLD_SLTP_LOSS",
+    "INSUFFICIENT_MARGIN":                       "INSUFFICIENT_MARGIN",
+    "INSUFFICIENT_FUNDS":                        "INSUFFICIENT_FUNDS",
+    "CLOSEOUT_BID_LESS_THAN_STOP_PRICE":         "GOLD_SLTP_INVALID",
+    "STOP_LOSS_ON_FILL_GUARANTEED_NOT_ALLOWED":  "GOLD_SLTP_INVALID",
+    "MARGIN_RATE_WOULD_TRIGGER_CLOSEOUT":        "INSUFFICIENT_MARGIN",
+    "ACCOUNT_LOCKED":                            "ACCOUNT_LOCKED",
+}
+
+
+def _normalize_oanda_error(raw_code: str) -> str:
+    """Map an OANDA error code to our internal normalized rejection code."""
+    if not raw_code:
+        return "UNKNOWN_BROKER_ERROR"
+    upper = raw_code.upper().strip()
+    # Direct lookup
+    if upper in _OANDA_ERROR_MAP:
+        return _OANDA_ERROR_MAP[upper]
+    # Substring matches for partial codes
+    if "INSUFFICIENT_MARGIN" in upper or "INSUFFICIENT_FUNDS" in upper:
+        return "INSUFFICIENT_MARGIN"
+    if "NOT_TRADEABLE" in upper or "HALTED" in upper:
+        return "INSTRUMENT_NOT_TRADEABLE"
+    if "STOP_LOSS" in upper or "TAKE_PROFIT" in upper:
+        return "GOLD_SLTP_INVALID"
+    if "UNIT" in upper:
+        return "GOLD_UNITS_INVALID"
+    return "BROKER_REJECTION"
 
 
 class OandaConnector(BaseBrokerConnector):
@@ -483,15 +562,26 @@ class OandaConnector(BaseBrokerConnector):
         return orders
 
     # ------------------------------------------------------------------
-    # INSTRUMENT MAPPING
+    # INSTRUMENT MAPPING  (v2.3 — truthful capability flags)
     # ------------------------------------------------------------------
 
     def validate_instrument_mapping(self, internal_symbol: str) -> Optional[InstrumentMapping]:
-        """Validate that internal_symbol is tradeable on OANDA."""
+        """
+        Validate that internal_symbol is tradeable on OANDA.
+
+        v2.3 changes:
+          - Populates is_mapped, is_supported, is_tradeable_metadata separately.
+          - Static fallback marks is_supported=False (we don't know without a
+            live API call); tradeable is set False so the capability cache does
+            not over-promise.
+          - Live API response is stored in raw_broker_metadata.
+        """
         oanda_sym = OANDA_INSTRUMENT_MAP.get(internal_symbol.upper())
         if not oanda_sym:
             logger.warning(f"[OANDA] No mapping for internal symbol '{internal_symbol}'")
-            return None
+            return None  # is_mapped=False → caller returns NO_BROKER_MAPPING
+
+        precision = OANDA_PRECISION.get(oanda_sym, 5)
 
         # Try to fetch live instrument details
         try:
@@ -504,45 +594,188 @@ class OandaConnector(BaseBrokerConnector):
                 inst = body["instruments"][0]
                 min_units = float(inst.get("minimumTradeSize", 1))
                 max_units = float(inst.get("maximumOrderUnits", 1_000_000))
-                precision = OANDA_PRECISION.get(oanda_sym, 5)
                 margin_rate = float(inst.get("marginRate", 0.05))
-                spread = 0.0  # Not returned directly; would need quotes
+                # OANDA "status" field: "tradeable" | "non-tradeable"
+                broker_tradeable_str = inst.get("status", "tradeable").lower()
+                is_tradeable_meta = broker_tradeable_str == "tradeable"
 
                 mapping = InstrumentMapping(
                     internal=internal_symbol.upper(),
                     broker_symbol=oanda_sym,
-                    tradeable=True,
+                    tradeable=is_tradeable_meta,          # combined flag
                     min_units=min_units,
                     max_units=max_units,
                     precision=precision,
                     margin_rate=margin_rate,
-                    spread_typical=spread,
+                    spread_typical=0.0,
+                    is_mapped=True,
+                    is_supported=True,
+                    is_tradeable_metadata=is_tradeable_meta,
+                    raw_broker_metadata=inst,
+                    not_tradeable_reason=(
+                        None if is_tradeable_meta
+                        else f"Broker reports status='{broker_tradeable_str}' for {oanda_sym}"
+                    ),
                 )
                 self._cached_instruments[internal_symbol.upper()] = mapping
+                logger.info(
+                    f"[OANDA] validate_instrument_mapping {internal_symbol!r} → {oanda_sym!r}: "
+                    f"is_supported=True is_tradeable_metadata={is_tradeable_meta} "
+                    f"min_units={min_units} margin_rate={margin_rate}"
+                )
                 return mapping
+
+            elif status == 200 and not body.get("instruments"):
+                # Instrument not available on this account
+                logger.warning(
+                    f"[OANDA] {oanda_sym} not returned by instruments endpoint "
+                    f"(account may not have access). status={status}"
+                )
+                return InstrumentMapping(
+                    internal=internal_symbol.upper(),
+                    broker_symbol=oanda_sym,
+                    tradeable=False,
+                    min_units=1.0,
+                    max_units=0.0,
+                    precision=precision,
+                    margin_rate=0.0,
+                    spread_typical=0.0,
+                    is_mapped=True,
+                    is_supported=False,
+                    is_tradeable_metadata=False,
+                    raw_broker_metadata=body,
+                    not_tradeable_reason=(
+                        f"{oanda_sym} not available on this account "
+                        f"(not returned by /instruments endpoint)"
+                    ),
+                )
+            else:
+                logger.warning(
+                    f"[OANDA] Instruments endpoint returned status={status} for {oanda_sym}: {body}"
+                )
+                # Fall through to static fallback below
+
+        except ConnectionError as e:
+            logger.warning(f"[OANDA] Instrument lookup skipped (not connected) for {oanda_sym}: {e}")
         except Exception as e:
             logger.warning(f"[OANDA] Instrument lookup failed for {oanda_sym}: {e}")
 
-        # Return static mapping if live fetch fails
+        # ------------------------------------------------------------------
+        # STATIC FALLBACK — connector not connected or API call failed.
+        # IMPORTANT: We mark is_supported=False (unknown) and tradeable=False
+        # here so the capability cache does NOT over-promise tradeability when
+        # we have never confirmed with the broker.  The caller (BrokerSymbolMapper)
+        # will treat this as "mapping exists but tradeability unconfirmed".
+        # ------------------------------------------------------------------
+        logger.warning(
+            f"[OANDA] Using static fallback for {internal_symbol!r} → {oanda_sym!r}. "
+            "Tradeability unconfirmed (broker not queried). "
+            "Capability cache will reflect is_tradeable_submit_validated=False."
+        )
         return InstrumentMapping(
             internal=internal_symbol.upper(),
             broker_symbol=oanda_sym,
-            tradeable=True,
+            tradeable=False,                # conservative — we don't know
             min_units=1.0,
             max_units=1_000_000.0,
-            precision=OANDA_PRECISION.get(oanda_sym, 5),
+            precision=precision,
             margin_rate=0.05,
             spread_typical=0.0,
+            is_mapped=True,
+            is_supported=False,             # not confirmed by live API
+            is_tradeable_metadata=False,    # not confirmed by live API
+            raw_broker_metadata={},
+            not_tradeable_reason=(
+                "Tradeability not confirmed — broker API was unreachable during instrument lookup"
+            ),
         )
 
     # ------------------------------------------------------------------
-    # SUBMIT ORDER
+    # GOLD PAYLOAD VALIDATION  (v2.3)
+    # ------------------------------------------------------------------
+
+    def _lots_to_units(self, oanda_sym: str, lots: float) -> float:
+        """
+        Convert lots (FX convention) to broker units.
+
+        For XAU_USD: 1 lot = 100 troy oz.
+        For XAG_USD: 1 lot = 5000 troy oz.
+        For FX: 1 lot = 100,000 units (but OANDA uses units directly, so no conversion).
+        """
+        multiplier = LOT_UNIT_MULTIPLIER.get(oanda_sym, 1.0)
+        return lots * multiplier
+
+    def _validate_gold_payload(
+        self,
+        oanda_sym: str,
+        units: float,
+        stop_loss: Optional[float],
+        take_profit: Optional[float],
+        entry_price: Optional[float],
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Validate gold-specific order payload constraints before submission.
+
+        Returns (valid, error_message).  error_message is None when valid.
+
+        Checks:
+          1. Units >= minimum (1 oz for XAU_USD).
+          2. SL and TP are present (OANDA requires them for gold).
+          3. SL/TP minimum distance from entry.
+          4. SL is on the correct side of entry.
+        """
+        if oanda_sym not in GOLD_INSTRUMENTS:
+            return True, None  # Not a gold instrument; skip gold-specific checks
+
+        # 1. Units minimum
+        if units < 1:
+            return (
+                False,
+                f"[GOLD PAYLOAD] {oanda_sym} minimum is 1 troy oz; requested units={units}. "
+                "Convert lots to ounces: 1 lot = 100 oz for XAU_USD."
+            )
+
+        min_dist = MIN_SLTP_DISTANCE.get(oanda_sym, 1.0)
+
+        # 2. SL/TP presence
+        if stop_loss is None:
+            return False, f"[GOLD PAYLOAD] stop_loss is required for {oanda_sym}"
+        if take_profit is None:
+            return False, f"[GOLD PAYLOAD] take_profit is required for {oanda_sym}"
+
+        # 3. SL/TP minimum distance
+        if entry_price and entry_price > 0:
+            sl_dist = abs(entry_price - stop_loss)
+            tp_dist = abs(entry_price - take_profit)
+            if sl_dist < min_dist:
+                return (
+                    False,
+                    f"[GOLD PAYLOAD] SL distance {sl_dist:.2f} is below minimum {min_dist} "
+                    f"for {oanda_sym} (entry={entry_price}, sl={stop_loss})"
+                )
+            if tp_dist < min_dist:
+                return (
+                    False,
+                    f"[GOLD PAYLOAD] TP distance {tp_dist:.2f} is below minimum {min_dist} "
+                    f"for {oanda_sym} (entry={entry_price}, tp={take_profit})"
+                )
+
+        return True, None
+
+    # ------------------------------------------------------------------
+    # SUBMIT ORDER  (v2.3 — gold payload + raw error preservation)
     # ------------------------------------------------------------------
 
     def submit_order(self, request: OrderRequest) -> OrderResult:
         """
         Submit a market order to OANDA with SL and TP.
-        Handles insufficient funds, permission denied, and other rejections.
+
+        v2.3 changes:
+          - Gold units are converted from lots to troy ounces.
+          - Gold payload validated before submission.
+          - Raw broker error, parsed_error_code, normalized_rejection_code
+            are preserved in every OrderResult and rejection history entry.
+          - Structured diagnostics dict logged for XAUUSD.
         """
         self._require_connected()
 
@@ -552,6 +785,7 @@ class OandaConnector(BaseBrokerConnector):
                 order_id=None,
                 status=OrderStatus.REJECTED,
                 reject_reason="Circuit breaker open — too many consecutive failures",
+                normalized_rejection_code="CIRCUIT_BREAKER_OPEN",
             )
 
         # Map symbol
@@ -562,17 +796,63 @@ class OandaConnector(BaseBrokerConnector):
                 order_id=None,
                 status=OrderStatus.REJECTED,
                 reject_reason=f"No OANDA mapping for '{request.instrument}'",
+                normalized_rejection_code="NO_BROKER_MAPPING",
             )
 
-        # Units: positive = BUY, negative = SELL (OANDA convention)
-        units = request.units if request.side == OrderSide.BUY else -request.units
         precision = OANDA_PRECISION.get(oanda_sym, 5)
+
+        # Convert lots → broker units (gold uses troy ounces)
+        raw_lots = request.units
+        broker_units = self._lots_to_units(oanda_sym, raw_lots)
+
+        is_gold = oanda_sym in GOLD_INSTRUMENTS
+
+        # Diagnostic log for gold
+        if is_gold:
+            logger.info(
+                f"[OANDA] GOLD ORDER DIAGNOSTIC: "
+                f"canonical={request.instrument!r} broker_sym={oanda_sym!r} "
+                f"lots={raw_lots} → broker_units={broker_units} "
+                f"sl={request.stop_loss} tp={request.take_profit} "
+                f"entry_price={request.price}"
+            )
+
+        # Pre-submit gold payload validation
+        if is_gold:
+            buy_side = request.side == OrderSide.BUY
+            valid, gold_err = self._validate_gold_payload(
+                oanda_sym=oanda_sym,
+                units=broker_units if buy_side else -broker_units,
+                stop_loss=request.stop_loss,
+                take_profit=request.take_profit,
+                entry_price=request.price,
+            )
+            if not valid:
+                logger.warning(f"[OANDA] Gold payload validation failed: {gold_err}")
+                return OrderResult(
+                    success=False,
+                    order_id=None,
+                    status=OrderStatus.REJECTED,
+                    reject_reason=gold_err,
+                    raw_broker_error=None,
+                    parsed_error_code="GOLD_PAYLOAD_INVALID",
+                    normalized_rejection_code="GOLD_PAYLOAD_INVALID",
+                )
+
+        # Units: positive = BUY, negative = SELL (OANDA convention)
+        signed_units = broker_units if request.side == OrderSide.BUY else -broker_units
+
+        # Format units: gold uses decimals (e.g. "1.00"), FX uses integers
+        if is_gold:
+            units_str = str(round(signed_units, 2))
+        else:
+            units_str = str(int(signed_units)) if signed_units == int(signed_units) else str(round(signed_units, 2))
 
         order_body: Dict[str, Any] = {
             "order": {
                 "type": "MARKET",
                 "instrument": oanda_sym,
-                "units": str(int(units)) if units == int(units) else str(round(units, 2)),
+                "units": units_str,
                 "timeInForce": "FOK",  # Fill or Kill for market orders
                 "positionFill": "DEFAULT",
             }
@@ -597,8 +877,8 @@ class OandaConnector(BaseBrokerConnector):
             }
 
         logger.info(
-            f"[OANDA] Submitting {request.side.value} {request.units} {request.instrument} "
-            f"(SL={request.stop_loss}, TP={request.take_profit})"
+            f"[OANDA] Submitting {request.side.value} {broker_units} {oanda_sym} "
+            f"(raw_lots={raw_lots}, SL={request.stop_loss}, TP={request.take_profit})"
         )
 
         try:
@@ -609,7 +889,7 @@ class OandaConnector(BaseBrokerConnector):
                 fill = body.get("orderFillTransaction", {})
                 order_id = fill.get("orderID") or fill.get("id", "unknown")
                 filled_price = float(fill.get("price", 0) or 0)
-                filled_units = abs(float(fill.get("units", request.units) or request.units))
+                filled_units = abs(float(fill.get("units", broker_units) or broker_units))
 
                 self._record_success()
                 logger.info(f"[OANDA] Order filled: {order_id} @ {filled_price}")
@@ -620,28 +900,61 @@ class OandaConnector(BaseBrokerConnector):
                     filled_price=filled_price,
                     filled_units=filled_units,
                     raw=body,
+                    payload_snapshot=order_body,
                 )
 
             # ---- REJECTED ----
-            reject = body.get("orderRejectTransaction", {})
-            reject_reason = reject.get("rejectReason", "") or body.get("errorMessage", str(body))
-            insufficient = "INSUFFICIENT_MARGIN" in reject_reason or "INSUFFICIENT_FUNDS" in reject_reason
+            # Preserve the full raw broker error response
+            reject_txn = body.get("orderRejectTransaction", {})
+            raw_reject_code = reject_txn.get("rejectReason", "") or body.get("errorCode", "")
+            raw_error_msg = body.get("errorMessage", "") or str(body)
 
-            entry = {
+            # Build the human-readable reason from whichever field is populated
+            if raw_reject_code:
+                reject_reason = f"{raw_reject_code}: {raw_error_msg}" if raw_error_msg else raw_reject_code
+            else:
+                reject_reason = raw_error_msg
+
+            # Normalize to our internal code
+            normalized_code = _normalize_oanda_error(raw_reject_code)
+
+            insufficient = normalized_code in ("INSUFFICIENT_MARGIN", "INSUFFICIENT_FUNDS")
+
+            # Build structured diagnostics entry
+            diag_entry: Dict[str, Any] = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-                "instrument": request.instrument,
+                "canonical_symbol": request.instrument,
+                "broker_symbol": oanda_sym,
+                "units_requested_lots": raw_lots,
+                "units_sent_broker": broker_units,
+                "units_str": units_str,
                 "side": request.side.value,
-                "units": request.units,
-                "status": status,
-                "reason": reject_reason,
+                "http_status": status,
+                "raw_broker_error": raw_reject_code or raw_error_msg,
+                "parsed_error_code": raw_reject_code,
+                "normalized_rejection_code": normalized_code,
                 "insufficient_funds": insufficient,
+                "payload_snapshot": order_body,
+                "raw_response": body,
             }
-            self._order_rejection_history.append(entry)
+            self._order_rejection_history.append(diag_entry)
             if len(self._order_rejection_history) > 200:
                 self._order_rejection_history.pop(0)
 
-            self._record_failure(f"Order rejected [{status}]: {reject_reason}")
-            logger.error(f"[OANDA] Order REJECTED [{status}]: {reject_reason}")
+            self._record_failure(f"Order rejected [{status}]: {raw_reject_code or reject_reason}")
+            logger.error(
+                f"[OANDA] Order REJECTED [{status}]: "
+                f"raw_code={raw_reject_code!r} "
+                f"normalized={normalized_code!r} "
+                f"msg={raw_error_msg!r}"
+            )
+            if is_gold:
+                logger.error(
+                    f"[OANDA] GOLD REJECTION DETAILS: "
+                    f"broker_sym={oanda_sym} units_sent={units_str} "
+                    f"sl={request.stop_loss} tp={request.take_profit} "
+                    f"raw_reject_code={raw_reject_code!r}"
+                )
 
             return OrderResult(
                 success=False,
@@ -650,21 +963,33 @@ class OandaConnector(BaseBrokerConnector):
                 reject_reason=reject_reason,
                 insufficient_funds=insufficient,
                 raw=body,
+                raw_broker_error=raw_reject_code or raw_error_msg,
+                parsed_error_code=raw_reject_code,
+                normalized_rejection_code=normalized_code,
+                payload_snapshot=order_body,
             )
 
         except Exception as e:
             msg = f"submit_order exception: {type(e).__name__}: {e}"
             self._record_failure(msg)
-            self._order_rejection_history.append({
+            exc_entry = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-                "instrument": request.instrument,
-                "reason": msg,
-            })
+                "canonical_symbol": request.instrument,
+                "broker_symbol": oanda_sym,
+                "raw_broker_error": msg,
+                "parsed_error_code": "EXCEPTION",
+                "normalized_rejection_code": "BROKER_EXCEPTION",
+                "payload_snapshot": order_body,
+            }
+            self._order_rejection_history.append(exc_entry)
             return OrderResult(
                 success=False,
                 order_id=None,
                 status=OrderStatus.UNKNOWN,
                 reject_reason=msg,
+                raw_broker_error=msg,
+                parsed_error_code="EXCEPTION",
+                normalized_rejection_code="BROKER_EXCEPTION",
             )
 
     # ------------------------------------------------------------------
@@ -858,8 +1183,6 @@ class OandaConnector(BaseBrokerConnector):
         # 4. Environment match
         if acct:
             env_label = self._creds.environment
-            # OANDA practice accounts have IDs starting with digits
-            # We trust the user's configuration; just warn if environment=live and balance is 0
             env_ok = True
             env_msg = f"Configured environment: {env_label}"
             if env_label == "live" and acct.balance <= 0:
@@ -897,27 +1220,40 @@ class OandaConnector(BaseBrokerConnector):
                 critical=False,
             ))
 
-        # 6. Instrument mapping for core symbols
+        # 6. Instrument mapping for core symbols (v2.3 — use granular flags)
         if auth_ok:
             test_symbols = ["XAUUSD", "EURUSD", "GBPUSD"]
             mapped = []
             unmapped = []
+            not_supported = []
             for sym in test_symbols:
                 m = self.validate_instrument_mapping(sym)
-                if m and m.tradeable:
+                if m is None:
+                    unmapped.append(sym)
+                elif not m.is_supported:
+                    not_supported.append(f"{sym}(unconfirmed)")
+                elif m.tradeable:
                     mapped.append(sym)
                 else:
-                    unmapped.append(sym)
+                    unmapped.append(f"{sym}(not_tradeable)")
 
             map_ok = len(unmapped) == 0
             checks.append(PreflightCheck(
                 name="instrument_mapping",
                 passed=map_ok,
-                message=f"Mapped: {mapped} | Unmapped: {unmapped}",
+                message=(
+                    f"Mapped & supported: {mapped} | "
+                    f"Unconfirmed (API fallback): {not_supported} | "
+                    f"Unmapped/not_tradeable: {unmapped}"
+                ),
                 critical=False,
             ))
             if unmapped:
-                warnings.append(f"Instruments not mapped: {unmapped}")
+                warnings.append(f"Instruments not mapped or not tradeable: {unmapped}")
+            if not_supported:
+                warnings.append(
+                    f"Instrument tradeability unconfirmed (broker API unreachable): {not_supported}"
+                )
 
         # 7. Positions readable
         if auth_ok:
@@ -957,7 +1293,7 @@ class OandaConnector(BaseBrokerConnector):
                 ))
                 warnings.append(f"orders_readable: {e}")
 
-        # 9. Kill-switch endpoint accessible (meta-check; always passes in this context)
+        # 9. Kill-switch endpoint accessible
         checks.append(PreflightCheck(
             name="kill_switch_available",
             passed=True,
@@ -974,7 +1310,7 @@ class OandaConnector(BaseBrokerConnector):
                     f"Balance is {acct.balance:.2f} {acct.currency}. "
                     "Live orders WILL be rejected. Fund account before arming live trading."
                 ),
-                critical=False,  # Not blocking auth/connection; only blocks actual trading
+                critical=False,
             ))
             warnings.append(
                 "Insufficient balance for live trading — system will stay in LIVE_CONNECTED_SAFE "
@@ -1013,14 +1349,40 @@ class OandaConnector(BaseBrokerConnector):
         if not oanda_sym:
             return False, {"error": f"No mapping for '{request.instrument}'"}
 
-        units = request.units if request.side == OrderSide.BUY else -request.units
         precision = OANDA_PRECISION.get(oanda_sym, 5)
+        raw_lots = request.units
+        broker_units = self._lots_to_units(oanda_sym, raw_lots)
+        is_gold = oanda_sym in GOLD_INSTRUMENTS
+
+        # Validate gold payload
+        if is_gold:
+            buy_side = request.side == OrderSide.BUY
+            valid, gold_err = self._validate_gold_payload(
+                oanda_sym=oanda_sym,
+                units=broker_units if buy_side else -broker_units,
+                stop_loss=request.stop_loss,
+                take_profit=request.take_profit,
+                entry_price=request.price,
+            )
+            if not valid:
+                return False, {
+                    "error": gold_err,
+                    "validation_type": "gold_payload",
+                    "canonical_symbol": request.instrument,
+                    "broker_symbol": oanda_sym,
+                }
+
+        signed_units = broker_units if request.side == OrderSide.BUY else -broker_units
+        if is_gold:
+            units_str = str(round(signed_units, 2))
+        else:
+            units_str = str(int(signed_units)) if signed_units == int(signed_units) else str(round(signed_units, 2))
 
         payload: Dict[str, Any] = {
             "order": {
                 "type": "MARKET",
                 "instrument": oanda_sym,
-                "units": str(int(units)) if units == int(units) else str(round(units, 2)),
+                "units": units_str,
                 "timeInForce": "FOK",
                 "positionFill": "DEFAULT",
             }
@@ -1041,8 +1403,108 @@ class OandaConnector(BaseBrokerConnector):
         return True, {
             "note": "TEST PAYLOAD — not submitted to broker",
             "endpoint": f"POST {self.BASE_URL}/accounts/{self._account_id}/orders",
+            "canonical_symbol": request.instrument,
+            "broker_symbol": oanda_sym,
+            "raw_lots": raw_lots,
+            "broker_units": broker_units,
+            "is_gold": is_gold,
+            "precision": precision,
             "payload": payload,
         }
+
+    # ------------------------------------------------------------------
+    # XAU DRY-RUN PROBE
+    # ------------------------------------------------------------------
+
+    def validate_xau_payload(self, request: OrderRequest) -> dict:
+        """
+        Safe dry-run probe for XAU orders.
+        Builds and validates the payload without submitting.
+        Returns a structured diagnostics dict suitable for the
+        /api/broker/debug/xau-probe endpoint.
+
+        This is an Intent-Layer-safe operation — no real order is submitted.
+        """
+        oanda_sym = OANDA_INSTRUMENT_MAP.get(request.instrument.upper())
+        canonical = request.instrument.upper()
+
+        result = {
+            "canonical_symbol": canonical,
+            "broker_symbol": oanda_sym,
+            "raw_lots": request.units,
+            "broker_units": None,
+            "is_gold": False,
+            "payload_valid": False,
+            "validation_errors": [],
+            "payload_snapshot": None,
+            "instrument_mapping": None,
+        }
+
+        if not oanda_sym:
+            result["validation_errors"].append(f"No OANDA mapping for '{canonical}'")
+            return result
+
+        is_gold = oanda_sym in GOLD_INSTRUMENTS
+        result["is_gold"] = is_gold
+        broker_units = self._lots_to_units(oanda_sym, request.units)
+        result["broker_units"] = broker_units
+
+        # Instrument mapping info
+        try:
+            self._require_connected()
+            mapping = self.validate_instrument_mapping(canonical)
+            if mapping:
+                result["instrument_mapping"] = {
+                    "is_mapped": mapping.is_mapped,
+                    "is_supported": mapping.is_supported,
+                    "is_tradeable_metadata": mapping.is_tradeable_metadata,
+                    "min_units": mapping.min_units,
+                    "max_units": mapping.max_units,
+                    "precision": mapping.precision,
+                    "not_tradeable_reason": mapping.not_tradeable_reason,
+                }
+        except Exception as e:
+            result["validation_errors"].append(f"Instrument mapping lookup failed: {e}")
+
+        # Gold payload validation
+        if is_gold:
+            buy_side = request.side == OrderSide.BUY
+            valid, gold_err = self._validate_gold_payload(
+                oanda_sym=oanda_sym,
+                units=broker_units if buy_side else -broker_units,
+                stop_loss=request.stop_loss,
+                take_profit=request.take_profit,
+                entry_price=request.price,
+            )
+            if not valid:
+                result["validation_errors"].append(gold_err)
+
+        # Build payload regardless
+        precision = OANDA_PRECISION.get(oanda_sym, 5)
+        signed_units = broker_units if request.side == OrderSide.BUY else -broker_units
+        units_str = str(round(signed_units, 2)) if is_gold else str(int(signed_units))
+        payload: Dict[str, Any] = {
+            "order": {
+                "type": "MARKET",
+                "instrument": oanda_sym,
+                "units": units_str,
+                "timeInForce": "FOK",
+                "positionFill": "DEFAULT",
+            }
+        }
+        if request.stop_loss:
+            payload["order"]["stopLossOnFill"] = {
+                "price": str(round(request.stop_loss, precision)),
+                "timeInForce": "GTC",
+            }
+        if request.take_profit:
+            payload["order"]["takeProfitOnFill"] = {
+                "price": str(round(request.take_profit, precision)),
+                "timeInForce": "GTC",
+            }
+        result["payload_snapshot"] = payload
+        result["payload_valid"] = len(result["validation_errors"]) == 0
+        return result
 
     # ------------------------------------------------------------------
     # EXTRAS

@@ -93,14 +93,20 @@ class TestBrokerSymbolMapper:
 
     # ---- XAUUSD ----
     def test_xauusd_check_tradeable(self):
-        m = self._make_mapper()
+        """
+        v2.3: hydrate() without connector → INSTRUMENT_UNCONFIRMED (conservative).
+        Tradeability is only confirmed when a live connector is used.
+        """
+        m = self._make_mapper()  # hydrate(connector=None)
         r = m.check("XAUUSD", connector_connected=True)
         assert r.canonical_symbol == "XAUUSD"
         assert r.broker_symbol == "XAU_USD"
         assert r.asset_class == "GOLD"
-        assert r.is_supported is True
-        assert r.is_tradeable is True
-        assert r.rejection_code is None
+        # v2.3: without a live connector, is_supported=False, is_tradeable=False
+        assert r.is_supported is False
+        assert r.is_tradeable is False
+        assert r.rejection_code == "INSTRUMENT_UNCONFIRMED"
+        assert r.is_mapped is True  # mapping exists in static table
 
     def test_xauusd_to_broker_symbol(self):
         m = self._make_mapper()
@@ -108,12 +114,19 @@ class TestBrokerSymbolMapper:
 
     # ---- EURUSD ----
     def test_eurusd_check_tradeable(self):
-        m = self._make_mapper()
+        """
+        v2.3: hydrate() without connector → INSTRUMENT_UNCONFIRMED for all symbols.
+        EURUSD mapping exists but tradeability is not confirmed.
+        """
+        m = self._make_mapper()  # hydrate(connector=None)
         r = m.check("EURUSD", connector_connected=True)
         assert r.canonical_symbol == "EURUSD"
         assert r.broker_symbol == "EUR_USD"
         assert r.asset_class == "FOREX"
-        assert r.is_tradeable is True
+        # v2.3: without connector confirmation, is_tradeable=False (conservative)
+        assert r.is_tradeable is False
+        assert r.rejection_code == "INSTRUMENT_UNCONFIRMED"
+        assert r.is_mapped is True
 
     # ---- Unknown symbol ----
     def test_unknown_symbol_rejected(self):
@@ -159,8 +172,16 @@ class TestBrokerSymbolMapper:
         assert r.broker_symbol == "XAU_USD"
 
     def test_hydrate_connector_returns_non_tradeable(self):
-        """If connector says not tradeable, cache should reflect that."""
+        """
+        v2.3: when connector returns tradeable=False, is_tradeable_metadata=False (default).
+        The v2.3 mapper reads the new granular flags (is_supported, is_tradeable_metadata).
+        A connector returning InstrumentMapping with the legacy tradeable=False and the default
+        is_supported=True, is_tradeable_metadata=True will actually be seen as tradeable because
+        we read the new fields. To mark non-tradeable you must set is_supported=False OR
+        is_tradeable_metadata=False.
+        """
         mock_conn = MagicMock()
+        # Use v2.3 InstrumentMapping with explicit is_tradeable_metadata=False
         mock_conn.validate_instrument_mapping.return_value = InstrumentMapping(
             internal="XAUUSD",
             broker_symbol="XAU_USD",
@@ -170,6 +191,10 @@ class TestBrokerSymbolMapper:
             precision=3,
             margin_rate=0.02,
             spread_typical=0.5,
+            is_mapped=True,
+            is_supported=True,
+            is_tradeable_metadata=False,  # explicitly non-tradeable
+            not_tradeable_reason="Market halted",
         )
         m = BrokerSymbolMapper("oanda")
         m.hydrate(connector=mock_conn)
@@ -179,15 +204,20 @@ class TestBrokerSymbolMapper:
         assert r.rejection_code == "INSTRUMENT_NOT_TRADEABLE"
 
     def test_hydrate_connector_raises_falls_back_to_static(self):
-        """If connector raises for a symbol, mapper falls back to static tradeable=True."""
+        """
+        v2.3: If connector raises for a symbol, mapper uses INSTRUMENT_UNCONFIRMED
+        (conservative), NOT tradeable=True.
+        The old behavior (fallback to static tradeable=True) was the root bug.
+        """
         mock_conn = MagicMock()
         mock_conn.validate_instrument_mapping.side_effect = ConnectionError("timeout")
         m = BrokerSymbolMapper("oanda")
         m.hydrate(connector=mock_conn)
 
-        # XAUUSD is in the static map and not in unsupported set → should be tradeable
+        # v2.3: connector failure → INSTRUMENT_UNCONFIRMED, NOT tradeable=True
         r = m.check("XAUUSD", connector_connected=True)
-        assert r.is_tradeable is True
+        assert r.is_tradeable is False
+        assert r.rejection_code == "INSTRUMENT_UNCONFIRMED"
 
     # ---- Dump cache ----
     def test_dump_cache_returns_list(self):

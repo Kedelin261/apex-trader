@@ -180,15 +180,31 @@ class PermissionsCheck:
 
 @dataclass
 class InstrumentMapping:
-    """Maps internal symbol to broker-specific symbol."""
-    internal: str        # e.g. "XAUUSD"
-    broker_symbol: str   # e.g. "XAU_USD" (OANDA format)
-    tradeable: bool
+    """Maps internal symbol to broker-specific symbol.
+
+    Capability semantics (v2.3):
+      is_mapped            — symbol has a broker-native ID in our map
+      is_supported         — broker confirmed the instrument exists on the account
+      is_tradeable_metadata — broker says it is currently open / not halted
+      tradeable            — combined flag: is_mapped AND is_supported AND is_tradeable_metadata
+                             (used by legacy callers; the granular flags tell the full story)
+    """
+    internal: str            # e.g. "XAUUSD"
+    broker_symbol: str       # e.g. "XAU_USD" (OANDA format)
+    tradeable: bool          # combined legacy flag
     min_units: float
     max_units: float
-    precision: int       # Decimal places for price
+    precision: int           # Decimal places for price
     margin_rate: float
     spread_typical: float
+    # Granular capability flags (v2.3) — all default to match `tradeable` for back-compat
+    is_mapped: bool = True
+    is_supported: bool = True
+    is_tradeable_metadata: bool = True
+    # Raw broker response for debugging
+    raw_broker_metadata: Dict[str, Any] = field(default_factory=dict)
+    # Reason string if any flag is False
+    not_tradeable_reason: Optional[str] = None
 
 
 @dataclass
@@ -232,6 +248,11 @@ class OrderResult:
     insufficient_funds: bool = False
     raw: Dict[str, Any] = field(default_factory=dict)
     submitted_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # v2.3 — structured rejection diagnostics
+    raw_broker_error: Optional[str] = None      # Exact OANDA rejectReason / errorMessage
+    parsed_error_code: Optional[str] = None     # OANDA error code (e.g. STOP_LOSS_ON_FILL_PRICE_MISSING)
+    normalized_rejection_code: Optional[str] = None  # Our code (e.g. INSTRUMENT_NOT_TRADEABLE)
+    payload_snapshot: Optional[Dict[str, Any]] = None  # Order body that was sent
 
     def safe_dict(self) -> dict:
         return {
@@ -243,6 +264,9 @@ class OrderResult:
             "reject_reason": self.reject_reason,
             "insufficient_funds": self.insufficient_funds,
             "submitted_at": self.submitted_at.isoformat(),
+            "raw_broker_error": self.raw_broker_error,
+            "parsed_error_code": self.parsed_error_code,
+            "normalized_rejection_code": self.normalized_rejection_code,
         }
 
 

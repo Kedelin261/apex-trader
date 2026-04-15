@@ -271,32 +271,60 @@ class BrokerManager:
         Route order based on execution state:
         - LIVE_ENABLED → real broker
         - All other states → paper broker
+
+        v2.3: structured rejection diagnostics are recorded in _rejection_history.
+        On successful live fill, marks the symbol as submit-validated in the mapper.
         """
+        from brokers.base_connector import OrderStatus as _OS
         if self._esm.is_kill_switch_active():
             return OrderResult(
                 success=False,
                 order_id=None,
-                status=__import__("brokers.base_connector", fromlist=["OrderStatus"]).OrderStatus.REJECTED,
+                status=_OS.REJECTED,
                 reject_reason="Kill switch ENGAGED — all trading halted",
+                normalized_rejection_code="KILL_SWITCH_ACTIVE",
             )
 
         if self._esm.is_live_trading_allowed():
             logger.info(f"[BrokerManager] Routing LIVE order: {request.instrument} {request.side.value}")
             result = self._connector.submit_order(request)
 
-            # Record rejections
-            if not result.success:
-                self._rejection_history.append({
+            if result.success:
+                # Mark symbol as submit-validated so capability cache reflects truth
+                if self._symbol_mapper:
+                    self._symbol_mapper.mark_submit_validated(request.instrument)
+                logger.info(
+                    f"[BrokerManager] LIVE order FILLED: {request.instrument} "
+                    f"order_id={result.order_id} price={result.filled_price}"
+                )
+            else:
+                # Structured rejection entry (v2.3)
+                diag = {
                     "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "instrument": request.instrument,
-                    "side": request.side.value,
+                    "canonical_symbol": request.instrument,
+                    "broker_symbol": (
+                        self._symbol_mapper.to_broker_symbol(request.instrument)
+                        if self._symbol_mapper else None
+                    ),
                     "units": request.units,
+                    "side": request.side.value,
                     "reason": result.reject_reason,
+                    "raw_broker_error": result.raw_broker_error,
+                    "parsed_error_code": result.parsed_error_code,
+                    "normalized_rejection_code": result.normalized_rejection_code,
                     "insufficient_funds": result.insufficient_funds,
+                    "payload_snapshot": result.payload_snapshot,
                     "mode": "LIVE",
-                })
+                }
+                self._rejection_history.append(diag)
                 if len(self._rejection_history) > 200:
                     self._rejection_history.pop(0)
+
+                logger.warning(
+                    f"[BrokerManager] LIVE order REJECTED: {request.instrument} "
+                    f"raw_broker_error={result.raw_broker_error!r} "
+                    f"normalized={result.normalized_rejection_code!r}"
+                )
 
                 # Auto-block on too many failures
                 if self._connector and self._connector.check_circuit_breaker():
@@ -309,7 +337,11 @@ class BrokerManager:
         else:
             # Paper mode
             logger.info(f"[BrokerManager] Routing PAPER order: {request.instrument} {request.side.value}")
-            return self._paper_broker.submit_order(request)
+            result = self._paper_broker.submit_order(request)
+            if result.success and self._symbol_mapper:
+                # Paper fills also validate submit-path
+                self._symbol_mapper.mark_submit_validated(request.instrument)
+            return result
 
     def validate_instrument(self, symbol: str) -> Optional[InstrumentMapping]:
         if self._connector:
@@ -372,6 +404,51 @@ class BrokerManager:
         if self._symbol_mapper:
             return self._symbol_mapper.dump_cache()
         return []
+
+    def get_xau_diagnostics(self, request: Optional[OrderRequest] = None) -> dict:
+        """
+        Return full XAUUSD diagnostic snapshot:
+          - capability cache entry for XAUUSD
+          - recent rejection history filtered to XAUUSD
+          - optional dry-run payload validation
+        Safe to call at any time; no real order submitted.
+        """
+        from brokers.symbol_mapper import TradeabilityResult
+        xau_cache = None
+        if self._symbol_mapper:
+            result = self._symbol_mapper.check("XAUUSD", connector_connected=self._esm.is_connected())
+            xau_cache = result.to_dict()
+
+        xau_rejections = [
+            r for r in self._rejection_history
+            if r.get("canonical_symbol") in ("XAUUSD", "XAU_USD")
+        ][-20:]
+
+        payload_probe = None
+        if request and self._connector and hasattr(self._connector, "validate_xau_payload"):
+            try:
+                payload_probe = self._connector.validate_xau_payload(request)
+            except Exception as e:
+                payload_probe = {"error": str(e)}
+
+        connector_rejections = []
+        if self._connector and hasattr(self._connector, "get_rejection_history"):
+            all_rej = self._connector.get_rejection_history()
+            connector_rejections = [
+                r for r in all_rej
+                if r.get("canonical_symbol") in ("XAUUSD", "XAU_USD")
+            ][-20:]
+
+        return {
+            "canonical_symbol": "XAUUSD",
+            "broker_symbol": "XAU_USD",
+            "capability_cache": xau_cache,
+            "broker_rejection_history": connector_rejections,
+            "manager_rejection_history": xau_rejections,
+            "payload_probe": payload_probe,
+            "broker_connected": self._esm.is_connected(),
+            "live_trading_allowed": self._esm.is_live_trading_allowed(),
+        }
 
     # ------------------------------------------------------------------
     # RECONCILIATION

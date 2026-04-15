@@ -290,7 +290,12 @@ class TestOandaConnectorMocked:
         assert not conn.check_circuit_breaker()
 
     def test_submit_order_records_rejection(self):
-        """Insufficient funds rejection is recorded in history."""
+        """
+        Insufficient funds rejection is recorded in history.
+        v2.3: XAUUSD requires stop_loss and take_profit for the gold payload validation.
+        Use EURUSD to test the INSUFFICIENT_MARGIN path, since EURUSD has no
+        gold payload constraints.  Alternatively test XAUUSD with valid SL/TP.
+        """
         conn = self._make_connector()
         from brokers.base_connector import ConnectionState, OrderRequest, OrderSide
         conn._connection_state = ConnectionState.AUTHENTICATED
@@ -303,10 +308,14 @@ class TestOandaConnectorMocked:
                     "type": "MARKET_ORDER_REJECT",
                 }
             })
+            # v2.3: include stop_loss and take_profit for gold, plus use enough units (>=1 oz)
             req = OrderRequest(
                 instrument="XAUUSD",
                 side=OrderSide.BUY,
-                units=100,
+                units=1.0,         # 1 lot = 100 oz — passes gold validation
+                stop_loss=2290.0,  # required for gold
+                take_profit=2325.0,
+                price=2300.0,
             )
             result = conn.submit_order(req)
 
@@ -314,6 +323,10 @@ class TestOandaConnectorMocked:
         assert result.insufficient_funds
         assert len(conn.get_rejection_history()) == 1
         assert conn.get_rejection_history()[0]["insufficient_funds"]
+        # v2.3: structured diagnostics
+        history_entry = conn.get_rejection_history()[0]
+        assert history_entry.get("normalized_rejection_code") == "INSUFFICIENT_MARGIN"
+        assert history_entry.get("canonical_symbol") == "XAUUSD"
 
     def test_instrument_mapping_xauusd(self):
         from brokers.oanda_connector import OANDA_INSTRUMENT_MAP

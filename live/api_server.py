@@ -635,11 +635,36 @@ async def get_ledger(limit: int = 50, msg_type: Optional[str] = None):
 async def broker_capability_cache():
     """
     Return the symbol capability cache hydrated on broker connect.
-    Shows canonical_symbol, broker_symbol, asset_class, is_supported,
-    is_tradeable, rejection_code for every known instrument.
+
+    v2.3 fields per instrument:
+      canonical_symbol, broker_symbol, asset_class,
+      is_mapped, is_supported, is_tradeable_metadata,
+      is_tradeable_submit_validated, is_tradeable (combined),
+      reason_if_not_tradeable, rejection_code, checked_at
+
+    IMPORTANT: is_tradeable=True only when:
+      1. is_mapped: canonical→broker mapping exists
+      2. is_supported: broker API confirmed instrument available on account
+      3. is_tradeable_metadata: broker API says instrument is open/not halted
+    is_tradeable_submit_validated=True only after a real or dry-run order
+    confirmed the full payload is accepted.
     """
     try:
         bm = get_broker_manager()
+        instruments = bm.get_capability_cache()
+        # Surface a clear warning if XAUUSD is not fully confirmed
+        xau_entry = next((i for i in instruments if i.get("canonical_symbol") == "XAUUSD"), None)
+        xau_warning = None
+        if xau_entry:
+            if not xau_entry.get("is_supported"):
+                xau_warning = (
+                    "XAUUSD capability unconfirmed — broker API was not reached "
+                    "during instrument lookup. Do not trust is_tradeable=True from cache."
+                )
+            elif not xau_entry.get("is_tradeable"):
+                xau_warning = (
+                    f"XAUUSD marked NOT tradeable: {xau_entry.get('reason_if_not_tradeable')}"
+                )
         return {
             "broker": bm._broker_name or "none",
             "hydrated": bm._symbol_mapper.is_hydrated if bm._symbol_mapper else False,
@@ -648,10 +673,90 @@ async def broker_capability_cache():
                 if bm._symbol_mapper and bm._symbol_mapper.hydrated_at
                 else None
             ),
-            "instruments": bm.get_capability_cache(),
+            "broker_connected": bm._esm.is_connected(),
+            "xauusd_warning": xau_warning,
+            "instruments": instruments,
         }
     except Exception as e:
         return {"error": str(e), "instruments": []}
+
+
+@app.get("/api/broker/debug/xau-diagnostics")
+async def xau_diagnostics(
+    lots: float = 0.10,
+    entry: float = 2300.0,
+    stop_loss: float = 2290.0,
+    take_profit: float = 2325.0,
+    side: str = "BUY",
+):
+    """
+    Full XAUUSD diagnostic endpoint (v2.3).
+
+    Returns:
+      - capability_cache: what the mapper thinks about XAUUSD
+      - payload_probe: dry-run payload validation (no order submitted)
+      - broker_rejection_history: recent XAUUSD rejections from connector
+      - manager_rejection_history: recent XAUUSD rejections from broker_manager
+      - broker_connected: current broker connection state
+      - live_trading_allowed: whether live orders can be placed
+
+    Use this to diagnose why OANDA is rejecting XAUUSD without placing a real order.
+    Safe to call at any time — no order is submitted.
+    """
+    try:
+        bm = get_broker_manager()
+        from brokers.base_connector import OrderRequest, OrderSide, OrderType
+        try:
+            order_side = OrderSide(side.upper())
+        except ValueError:
+            order_side = OrderSide.BUY
+
+        probe_request = OrderRequest(
+            instrument="XAUUSD",
+            side=order_side,
+            units=lots,
+            order_type=OrderType.MARKET,
+            price=entry,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            comment="xau-diagnostics-probe",
+        )
+        diag = bm.get_xau_diagnostics(probe_request)
+        diag["probe_params"] = {
+            "lots": lots,
+            "entry": entry,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "side": side,
+        }
+        return diag
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/broker/debug/rejection-history")
+async def rejection_history_detail(limit: int = 50):
+    """
+    Full structured rejection history (v2.3).
+    Includes raw_broker_error, parsed_error_code, normalized_rejection_code,
+    payload_snapshot for every rejected order.
+    """
+    try:
+        bm = get_broker_manager()
+        # Broker-manager-level history
+        mgr_history = bm.rejection_history(limit)
+        # Connector-level history (more granular for live orders)
+        conn_history = []
+        if bm._connector and hasattr(bm._connector, "get_rejection_history"):
+            conn_history = bm._connector.get_rejection_history()[-limit:]
+        return {
+            "manager_rejection_history": mgr_history,
+            "connector_rejection_history": conn_history,
+            "total_manager": len(bm._rejection_history),
+            "total_connector": len(conn_history),
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @app.get("/api/positions")
