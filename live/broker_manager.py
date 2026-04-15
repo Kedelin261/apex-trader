@@ -100,6 +100,54 @@ def get_broker_for_symbol(canonical_symbol: str) -> str:
     return "paper"
 
 
+def get_route_log(canonical_symbol: str) -> dict:
+    """
+    Return structured routing decision log for a symbol.
+    Used by API endpoints for audit/observability.
+
+    Example output:
+        {
+            "symbol": "XAUUSD",
+            "canonical": "XAUUSD",
+            "asset_class": "GOLD",
+            "broker_selected": "ibkr",
+            "route_reason": "GOLD → IBKR (Futures mapping)"
+        }
+    """
+    from brokers.ibkr_connector import IBKR_CONTRACT_MAP
+
+    sym = canonical_symbol.upper().strip()
+    broker = get_broker_for_symbol(sym)
+
+    # Determine asset class from IBKR map or known sets
+    asset_class = "UNKNOWN"
+    route_reason = f"symbol='{sym}' → broker='{broker}'"
+
+    if sym in OANDA_ROUTING:
+        asset_class = "FOREX"
+        route_reason = "FOREX → OANDA (exclusively)"
+    elif sym in IBKR_ROUTING:
+        contract = IBKR_CONTRACT_MAP.get(sym)
+        if contract:
+            asset_class = contract.asset_class.value
+            route_reason = (
+                f"{asset_class} → IBKR "
+                f"(sec_type={contract.sec_type} exchange={contract.exchange})"
+            )
+        else:
+            route_reason = "IBKR routing table match (no contract map entry)"
+    else:
+        route_reason = "not in routing table → paper fallback"
+
+    return {
+        "symbol": sym,
+        "canonical": sym,
+        "asset_class": asset_class,
+        "broker_selected": broker,
+        "route_reason": route_reason,
+    }
+
+
 class BrokerManager:
     """
     Central broker management layer.
@@ -262,17 +310,27 @@ class BrokerManager:
 
     def _connect_ibkr(self, operator: str) -> Tuple[bool, str]:
         """Connect IBKR for XAUUSD / Futures / Stocks / Indices / Commodities."""
-        try:
-            creds = self._cred_mgr.load_ibkr()
-        except AttributeError:
-            # CredentialManager doesn't have load_ibkr yet — use env vars directly
-            creds = _build_ibkr_creds_from_env()
-
-        if creds is None:
-            msg = "IBKR credentials not found. Set APEX_IBKR_ACCOUNT_ID and APEX_IBKR_ENVIRONMENT."
-            logger.warning(f"[BrokerManager] {msg}")
+        # First validate environment variables
+        env_check = self._cred_mgr.validate_ibkr_env()
+        if not env_check["valid"]:
+            msg = (
+                f"IBKR environment not configured: "
+                f"missing={env_check.get('missing',[])} "
+                f"invalid={env_check.get('invalid',[])}"
+            )
+            logger.error(f"[BrokerManager] {msg}")
             return False, msg
 
+        creds = self._cred_mgr.load_ibkr()
+        if creds is None or not creds.is_usable():
+            msg = (
+                f"IBKR credentials invalid: "
+                f"{getattr(creds, 'validation_errors', ['load failed'])}"
+            )
+            logger.error(f"[BrokerManager] {msg}")
+            return False, msg
+
+        # Build connector with creds from env vars
         from brokers.ibkr_connector import IBKRConnector
         self._ibkr_connector = IBKRConnector(creds)
         self._ibkr_broker_name = "ibkr"
@@ -808,6 +866,81 @@ class BrokerManager:
     # ------------------------------------------------------------------
     # IBKR-SPECIFIC HELPERS
     # ------------------------------------------------------------------
+
+    def ibkr_health(self) -> dict:
+        """
+        Return IBKR-specific health status.
+
+        GET /api/broker/ibkr/health
+        """
+        import socket as _socket
+        import time as _time
+
+        conn = self._ibkr_connector
+        if conn is None:
+            return {
+                "connected": False,
+                "state": "NOT_INITIALISED",
+                "account_id": None,
+                "latency_ms": None,
+                "last_heartbeat": None,
+                "error": "IBKR connector not initialised. Call POST /api/broker/connect with broker='ibkr'.",
+            }
+
+        # Connection state
+        state = getattr(conn, "_conn_state", None)
+        state_val = state.value if state else "UNKNOWN"
+        connected = conn.is_connected() if hasattr(conn, "is_connected") else False
+        account_id = getattr(conn, "_account_id", None)
+        host = getattr(conn, "_host", "127.0.0.1")
+        port = getattr(conn, "_port", 7497)
+        env  = getattr(conn, "_environment", "practice")
+        circuit_open = getattr(conn, "_circuit_open", False)
+        consec_fail  = getattr(conn, "_consecutive_failures", 0)
+
+        # Measure socket latency
+        latency_ms = None
+        if connected:
+            try:
+                t0 = _time.monotonic()
+                with _socket.create_connection((host, port), timeout=2):
+                    pass
+                latency_ms = round((_time.monotonic() - t0) * 1000, 2)
+            except Exception:
+                latency_ms = None
+
+        # Last heartbeat from EClient wrapper (if available)
+        ib_app = getattr(conn, "_ib_app", None)
+        last_heartbeat = None
+        if ib_app and hasattr(ib_app, "last_heartbeat_at"):
+            ts = ib_app.last_heartbeat_at
+            last_heartbeat = ts.isoformat() if ts else None
+
+        error_state = None
+        if not connected:
+            error_state = (
+                "circuit_breaker_open" if circuit_open
+                else "not_connected"
+            )
+
+        return {
+            "connected": connected,
+            "state": state_val,
+            "account_id": account_id,
+            "environment": env,
+            "host": host,
+            "port": port,
+            "client_id": getattr(conn, "_client_id", 1),
+            "latency_ms": latency_ms,
+            "last_heartbeat": last_heartbeat,
+            "circuit_breaker_open": circuit_open,
+            "consecutive_failures": consec_fail,
+            "error": error_state,
+        }
+
+    def validate_ibkr_env(self) -> dict:
+        """Validate IBKR environment variables are present and valid."""
+        return self._cred_mgr.validate_ibkr_env()
 
     def get_ibkr_contract(self, symbol: str) -> Optional[dict]:
         """Return IBKR contract spec for a canonical symbol."""

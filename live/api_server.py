@@ -1,6 +1,6 @@
 """
-APEX MULTI-MARKET TJR ENGINE v2.0
-API Server — Production FastAPI backend with full broker connectivity.
+APEX MULTI-MARKET TJR ENGINE v3.0
+API Server — Production FastAPI backend with full multi-broker connectivity.
 
 Endpoints (legacy):
   POST /api/signal          — TradingView webhook ingest
@@ -97,8 +97,8 @@ CONFIG = load_config()
 
 app = FastAPI(
     title="Apex Multi-Market TJR Engine",
-    description="Production-grade autonomous trading system v2.0",
-    version="2.0.0",
+    description="Production-grade autonomous trading system v3.0",
+    version="3.0.0",
 )
 
 app.add_middleware(
@@ -516,7 +516,7 @@ async def system_status():
 
         return {
             "system": "Apex Multi-Market TJR Engine",
-            "version": "2.0.0",
+            "version": "3.0.0",
             "environment": runtime_environment,
             "uptime_hours": round(uptime, 2),
             "kill_switch_active": orch._kill_switch or snap.kill_switch_active,
@@ -541,7 +541,7 @@ async def system_status():
     except Exception as e:
         return {
             "system": "Apex Multi-Market TJR Engine",
-            "version": "2.0.0",
+            "version": "3.0.0",
             "status": "INITIALIZING",
             "uptime_hours": round(uptime, 2),
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -788,7 +788,7 @@ async def get_internal_positions():
 
 @app.post("/api/backtest/run")
 async def run_backtest(req: BacktestRequest, background_tasks: BackgroundTasks):
-    log_event("INFO", f"Backtest requested: {req.instrument}", req.dict())
+    log_event("INFO", f"Backtest requested: {req.instrument}", req.model_dump())
     try:
         inst_type = InstrumentType(req.instrument_type)
         venue_type = VenueType(req.venue_type)
@@ -835,11 +835,29 @@ async def broker_connect(req: BrokerConnectRequest):
         broker_status,
     )
 
+    # Build per-broker connection result for IBKR
+    ibkr_result = None
+    if req.broker in ("ibkr", "both") and bm._ibkr_connector:
+        ibkr_result = {
+            "connected": bm._ibkr_connector.is_connected()
+                if hasattr(bm._ibkr_connector, "is_connected") else False,
+            "broker": "ibkr",
+            "state": (
+                bm._ibkr_connector._conn_state.value
+                if hasattr(bm._ibkr_connector, "_conn_state") else "UNKNOWN"
+            ),
+            "account_id": getattr(bm._ibkr_connector, "_account_id", None),
+            "environment": getattr(bm._ibkr_connector, "_environment", None),
+        }
+
     return {
         "success": ok,
         "message": msg,
+        "connected": ok,
+        "broker": req.broker,
         "execution_state": broker_status["execution_state"],
         "broker_status": broker_status,
+        "ibkr": ibkr_result,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1159,7 +1177,648 @@ async def get_logs(limit: int = 50):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "2.0.0", "timestamp": datetime.now(timezone.utc).isoformat()}
+    return {"status": "ok", "version": "3.0.0", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+# =============================================================================
+# PHASE 1 — IBKR-SPECIFIC ENDPOINTS
+# =============================================================================
+
+@app.get("/api/broker/ibkr/health")
+async def ibkr_health():
+    """
+    IBKR-specific health check.
+
+    Returns:
+        connection status, latency_ms, last heartbeat, error state,
+        account_id, environment, circuit_breaker_open
+    """
+    try:
+        bm = get_broker_manager()
+        return bm.ibkr_health()
+    except Exception as e:
+        return {
+            "connected": False,
+            "state": "ERROR",
+            "error": str(e),
+        }
+
+
+@app.get("/api/broker/ibkr/env-check")
+async def ibkr_env_check():
+    """
+    Validate IBKR environment variables without attempting a connection.
+
+    Returns structured error if any required variable is missing:
+        {"valid": false, "error": "IBKR_ENV_NOT_CONFIGURED",
+         "missing": ["APEX_IBKR_ACCOUNT_ID"], "invalid": []}
+    """
+    try:
+        bm = get_broker_manager()
+        return bm.validate_ibkr_env()
+    except Exception as e:
+        return {"valid": False, "error": str(e)}
+
+
+@app.get("/api/broker/routing-table")
+async def broker_routing_table():
+    """
+    Return the complete broker routing table with audit log for key symbols.
+    """
+    try:
+        from live.broker_manager import get_route_log, OANDA_ROUTING, IBKR_ROUTING
+        bm = get_broker_manager()
+
+        audit_symbols = ["EURUSD", "XAUUSD", "AAPL", "ES", "NQ", "GBPUSD", "USOIL", "US500"]
+        audit = [get_route_log(s) for s in audit_symbols]
+
+        return {
+            "routing_table": bm.get_routing_table(),
+            "audit": audit,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/broker/route/{symbol}")
+async def route_symbol(symbol: str):
+    """
+    Return routing decision for a given symbol with full audit log.
+    """
+    try:
+        from live.broker_manager import get_route_log
+        return get_route_log(symbol.upper())
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# =============================================================================
+# PHASE 2 — ROUTING VALIDATION ENDPOINT
+# =============================================================================
+
+@app.get("/api/broker/routing-validate")
+async def routing_validate():
+    """
+    Run the required routing test matrix:
+      EURUSD → OANDA
+      XAUUSD → IBKR
+      AAPL   → IBKR
+      ES     → IBKR
+
+    Returns PASS/FAIL per symbol with route_reason.
+    """
+    try:
+        from live.broker_manager import get_route_log
+
+        test_matrix = {
+            "EURUSD": "oanda",
+            "XAUUSD": "ibkr",
+            "AAPL":   "ibkr",
+            "ES":     "ibkr",
+        }
+
+        results = []
+        all_pass = True
+        for symbol, expected_broker in test_matrix.items():
+            route = get_route_log(symbol)
+            actual_broker = route["broker_selected"]
+            passed = (actual_broker == expected_broker)
+            if not passed:
+                all_pass = False
+            results.append({
+                **route,
+                "expected_broker": expected_broker,
+                "pass": passed,
+            })
+
+        return {
+            "all_pass": all_pass,
+            "test_matrix": results,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        return {"error": str(e), "all_pass": False}
+
+
+# =============================================================================
+# PHASE 3 — EXECUTION STATE MACHINE (execution/history already exists)
+# =============================================================================
+
+@app.get("/api/execution/transitions")
+async def execution_transitions(limit: int = 100):
+    """
+    Full state transition history with preflight_passed flags.
+    """
+    try:
+        bm = get_broker_manager()
+        return {
+            "current_state": bm._esm.current_state().value,
+            "live_trading_allowed": bm._esm.is_live_trading_allowed(),
+            "kill_switch_active": bm._esm.is_kill_switch_active(),
+            "transitions": bm.transition_history(limit),
+            "count": len(bm._esm._transition_log),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# =============================================================================
+# PHASE 4 — AUTONOMOUS SCHEDULER ENDPOINT
+# =============================================================================
+
+# Scheduler singleton
+_scheduler = None
+
+
+def get_scheduler():
+    global _scheduler
+    if _scheduler is None:
+        from live.autonomous_scheduler import AutonomousScheduler
+        orch = get_orchestrator()
+        bm = get_broker_manager()
+        ds = get_data_service()
+        _scheduler = AutonomousScheduler(
+            orchestrator=orch,
+            broker_manager=bm,
+            config=CONFIG,
+            market_data_service=ds,
+        )
+        _scheduler.start()
+        log_event("INFO", "AutonomousScheduler started", {})
+    return _scheduler
+
+
+@app.get("/api/system/scheduler")
+async def scheduler_status():
+    """
+    Return autonomous scheduler status: running state, all 5 loop states,
+    loaded strategies, pending signals, candle cache.
+    """
+    try:
+        sched = get_scheduler()
+        status = sched.status()
+
+        # Enrich with per-loop thread health
+        loop_names = [
+            "market-data-loop",
+            "strategy-scan-loop",
+            "signal-process-loop",
+            "position-monitor-loop",
+            "reconciliation-loop",
+        ]
+        thread_health = {}
+        for t in sched._threads:
+            if t.name in loop_names:
+                thread_health[t.name] = "ALIVE" if t.is_alive() else "DEAD"
+
+        return {
+            **status,
+            "loop_health": thread_health,
+            "loops_expected": loop_names,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        return {"error": str(e), "running": False}
+
+
+@app.post("/api/system/scheduler/start")
+async def scheduler_start():
+    """Start the autonomous scheduler if not already running."""
+    try:
+        sched = get_scheduler()
+        if not sched._running:
+            sched.start()
+        return {
+            "started": True,
+            "running": sched._running,
+            "strategies": list(sched._strategies.keys()),
+        }
+    except Exception as e:
+        return {"error": str(e), "started": False}
+
+
+@app.post("/api/system/scheduler/stop")
+async def scheduler_stop():
+    """Stop the autonomous scheduler."""
+    global _scheduler
+    try:
+        if _scheduler and _scheduler._running:
+            _scheduler.stop()
+        return {"stopped": True}
+    except Exception as e:
+        return {"error": str(e), "stopped": False}
+
+
+# =============================================================================
+# PHASE 5 — STRATEGY VALIDATION ENDPOINT
+# =============================================================================
+
+@app.get("/api/strategies/performance")
+async def strategies_performance():
+    """
+    Return per-strategy performance metrics from the live trade ledger.
+    Groups trades by strategy_family; computes win_rate, avg_r, total_pnl.
+    """
+    try:
+        orch = get_orchestrator()
+        trades = orch._all_trades
+
+        from collections import defaultdict
+        by_strategy = defaultdict(list)
+        for t in trades:
+            key = t.strategy_family.value if hasattr(t.strategy_family, "value") else str(t.strategy_family)
+            by_strategy[key].append(t)
+
+        perf = {}
+        for strat, strat_trades in by_strategy.items():
+            closed = [t for t in strat_trades if t.exit_time is not None]
+            wins   = [t for t in closed if t.realized_pnl_usd > 0]
+            losses = [t for t in closed if t.realized_pnl_usd <= 0]
+            total_pnl = sum(t.realized_pnl_usd for t in closed)
+            avg_r = (
+                sum(getattr(t, "r_multiple", 0) for t in closed) / len(closed)
+                if closed else 0.0
+            )
+            perf[strat] = {
+                "total_trades": len(strat_trades),
+                "closed_trades": len(closed),
+                "open_trades": len(strat_trades) - len(closed),
+                "wins": len(wins),
+                "losses": len(losses),
+                "win_rate": round(len(wins) / len(closed) * 100, 1) if closed else 0.0,
+                "total_pnl_usd": round(total_pnl, 2),
+                "avg_r_multiple": round(avg_r, 3),
+            }
+
+        # Add all registered strategies (even with no trades yet)
+        try:
+            sched = get_scheduler()
+            for strat_name in sched._strategies:
+                if strat_name not in perf:
+                    perf[strat_name] = {
+                        "total_trades": 0, "closed_trades": 0,
+                        "open_trades": 0, "wins": 0, "losses": 0,
+                        "win_rate": 0.0, "total_pnl_usd": 0.0, "avg_r_multiple": 0.0,
+                        "status": "loaded_no_trades_yet",
+                    }
+        except Exception:
+            pass
+
+        return {
+            "strategy_count": len(perf),
+            "strategies": perf,
+            "total_trades": len(trades),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        return {"error": str(e), "strategies": {}}
+
+
+@app.get("/api/strategies/list")
+async def strategies_list():
+    """Return all loaded strategies with metadata."""
+    try:
+        from live.autonomous_scheduler import AutonomousScheduler
+        sched = get_scheduler()
+        result = []
+        for name, strategy in sched._strategies.items():
+            result.append({
+                "name": name,
+                "class": type(strategy).__name__,
+                "asset_class": getattr(strategy, "asset_class", "UNKNOWN"),
+            })
+        return {
+            "loaded": len(result),
+            "strategies": result,
+        }
+    except Exception as e:
+        return {"error": str(e), "strategies": []}
+
+
+# =============================================================================
+# PHASE 6 — RISK NORMALISATION DEBUG ENDPOINT
+# =============================================================================
+
+@app.get("/api/risk/normalise")
+async def risk_normalise(
+    symbol: str = "XAUUSD",
+    asset_class: str = "FUTURES",
+    account_balance: float = 100000.0,
+    entry_price: float = 2350.0,
+    stop_loss: float = 2340.0,
+    risk_pct: float = 1.0,
+):
+    """
+    Debug endpoint: return exact position sizing for given parameters.
+
+    Example for FUTURES:
+        {
+            "asset_class": "FUTURES",
+            "risk_usd": 100,
+            "contracts": 1
+        }
+    """
+    try:
+        from live.autonomous_scheduler import RiskNormaliser
+        normaliser = RiskNormaliser(risk_pct=risk_pct)
+        result = normaliser.calculate(
+            symbol=symbol,
+            asset_class=asset_class,
+            account_balance=account_balance,
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+        )
+        risk_usd = account_balance * (risk_pct / 100.0)
+        return {
+            "symbol": symbol,
+            "asset_class": asset_class,
+            "account_balance": account_balance,
+            "risk_pct": risk_pct,
+            "risk_usd": round(risk_usd, 2),
+            "entry_price": entry_price,
+            "stop_loss": stop_loss,
+            "sl_distance": abs(entry_price - stop_loss),
+            "sizing": result,
+            # Convenience top-level fields
+            "units": result.get("units"),
+            "method": result.get("method"),
+            "actual_risk_usd": result.get("risk_usd"),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/risk/normalise")
+async def risk_normalise_post(body: dict):
+    """POST version of risk normaliser debug endpoint."""
+    return await risk_normalise(
+        symbol=body.get("symbol", "XAUUSD"),
+        asset_class=body.get("asset_class", "FUTURES"),
+        account_balance=body.get("account_balance", 100000.0),
+        entry_price=body.get("entry_price", 2350.0),
+        stop_loss=body.get("stop_loss", 2340.0),
+        risk_pct=body.get("risk_pct", 1.0),
+    )
+
+
+# =============================================================================
+# PHASE 7 — PREFLIGHT HARD VALIDATION (GET version)
+# =============================================================================
+
+@app.get("/api/broker/preflight")
+async def get_preflight_status():
+    """
+    GET preflight status — returns last preflight result and whether
+    the system is allowed to enter LIVE_ENABLED state.
+
+    The system CANNOT enter LIVE_ENABLED unless ALL checks pass.
+    POST /api/broker/preflight to run a new preflight check.
+    """
+    try:
+        bm = get_broker_manager()
+        snap = bm._esm.snapshot()
+
+        # Check if preflight has been run
+        preflight_run = snap.preflight_passed is not None
+        preflight_passed = snap.preflight_passed or False
+        preflight_at = snap.preflight_performed_at
+
+        # Determine blockers for LIVE_ENABLED
+        blockers = []
+        if not bm._esm.is_connected():
+            blockers.append("NOT_CONNECTED: No broker connected. Call POST /api/broker/connect.")
+        if not preflight_run:
+            blockers.append("PREFLIGHT_NOT_RUN: Run POST /api/broker/preflight first.")
+        elif not preflight_passed:
+            blockers.append("PREFLIGHT_FAILED: Resolve all blocking preflight failures.")
+        if snap.kill_switch_active:
+            blockers.append("KILL_SWITCH_ENGAGED: Reset via POST /api/control/resume.")
+
+        can_arm_live = (
+            bm._esm.is_connected()
+            and preflight_passed
+            and not snap.kill_switch_active
+            and snap.state == "LIVE_CONNECTED_SAFE"
+        )
+
+        return {
+            "preflight_run": preflight_run,
+            "preflight_passed": preflight_passed,
+            "preflight_at": preflight_at,
+            "current_state": snap.state,
+            "can_arm_live": can_arm_live,
+            "blockers_for_live": blockers,
+            "broker": snap.broker,
+            "environment": snap.environment,
+            "account_id": snap.account_id,
+            "connectors": {
+                "oanda": bm._connector is not None,
+                "ibkr": bm._ibkr_connector is not None,
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# =============================================================================
+# PHASE 8 — FAILURE MODE SIMULATION ENDPOINTS
+# =============================================================================
+
+@app.post("/api/debug/simulate/ibkr-disconnect")
+async def simulate_ibkr_disconnect():
+    """
+    Simulate IBKR disconnect.
+    Forces the IBKR connector into ERROR state and records a rejection.
+    Used for failure mode testing.
+    """
+    try:
+        bm = get_broker_manager()
+        if bm._ibkr_connector is None:
+            return {"error": "IBKR connector not initialised", "simulated": False}
+
+        from brokers.base_connector import ConnectionState
+        bm._ibkr_connector._conn_state = ConnectionState.ERROR
+        bm._ibkr_connector._consecutive_failures = 5
+        bm._ibkr_connector._circuit_open = True
+
+        log_event("WARNING", "[SIMULATION] IBKR disconnect simulated", {})
+        return {
+            "simulated": True,
+            "action": "ibkr_disconnect",
+            "new_state": bm._ibkr_connector._conn_state.value,
+            "circuit_open": True,
+            "note": "Call POST /api/broker/connect broker=ibkr to reconnect",
+        }
+    except Exception as e:
+        return {"error": str(e), "simulated": False}
+
+
+@app.post("/api/debug/simulate/insufficient-funds")
+async def simulate_insufficient_funds():
+    """
+    Simulate an order rejection due to insufficient funds.
+    Submits a deliberately oversized paper order and returns the rejection record.
+    """
+    try:
+        bm = get_broker_manager()
+        from brokers.base_connector import OrderRequest, OrderSide, OrderType, OrderStatus, OrderResult
+
+        # Build a large order that would fail funds check
+        req = OrderRequest(
+            instrument="XAUUSD",
+            side=OrderSide.BUY,
+            units=999999.0,
+            order_type=OrderType.MARKET,
+            price=2350.0,
+            stop_loss=2340.0,
+            take_profit=2370.0,
+            comment="simulation:insufficient_funds",
+        )
+
+        # Directly inject a simulated rejection
+        rejection = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "canonical_symbol": "XAUUSD",
+            "target_broker": "ibkr",
+            "broker_symbol": "GC",
+            "units": 999999.0,
+            "side": "BUY",
+            "reason": "MARGIN_INSUFFICIENT: Insufficient funds for position size",
+            "raw_broker_error": "Order quantity exceeds margin available",
+            "parsed_error_code": "MARGIN_INSUFFICIENT",
+            "normalized_rejection_code": "INSUFFICIENT_FUNDS",
+            "insufficient_funds": True,
+            "payload_snapshot": {"instrument": "XAUUSD", "units": 999999, "mode": "SIMULATION"},
+            "mode": "SIMULATION",
+        }
+        bm._rejection_history.append(rejection)
+        if len(bm._rejection_history) > 200:
+            bm._rejection_history.pop(0)
+
+        log_event("WARNING", "[SIMULATION] Insufficient funds rejection injected", {})
+        return {
+            "simulated": True,
+            "action": "insufficient_funds",
+            "rejection_injected": rejection,
+        }
+    except Exception as e:
+        return {"error": str(e), "simulated": False}
+
+
+@app.post("/api/debug/simulate/invalid-symbol")
+async def simulate_invalid_symbol():
+    """
+    Simulate an invalid symbol rejection.
+    Calls check_symbol with a deliberately unknown symbol.
+    """
+    try:
+        bm = get_broker_manager()
+        result = bm.check_symbol("INVALID_SYMBOL_XYZ")
+
+        log_event("WARNING", "[SIMULATION] Invalid symbol check", {"symbol": "INVALID_SYMBOL_XYZ"})
+        return {
+            "simulated": True,
+            "action": "invalid_symbol",
+            "symbol": "INVALID_SYMBOL_XYZ",
+            "is_tradeable": result.is_tradeable,
+            "rejection_code": result.rejection_code,
+            "reason": result.reason_if_not_tradeable,
+        }
+    except Exception as e:
+        return {"error": str(e), "simulated": False}
+
+
+@app.post("/api/debug/simulate/repeated-failures")
+async def simulate_repeated_failures():
+    """
+    Simulate repeated consecutive broker failures.
+    After CIRCUIT_THRESHOLD failures the circuit breaker opens and
+    the execution state transitions to LIVE_BLOCKED.
+    """
+    try:
+        bm = get_broker_manager()
+
+        # Inject 5+ failures into rejection history for the same symbol
+        failure_count = 6
+        for i in range(failure_count):
+            bm._rejection_history.append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "canonical_symbol": "ES",
+                "target_broker": "ibkr",
+                "broker_symbol": "ES",
+                "units": 1.0,
+                "side": "BUY",
+                "reason": f"Simulated consecutive failure #{i+1}",
+                "raw_broker_error": "Connection timeout",
+                "parsed_error_code": "TIMEOUT",
+                "normalized_rejection_code": "BROKER_TIMEOUT",
+                "insufficient_funds": False,
+                "payload_snapshot": {"instrument": "ES", "units": 1},
+                "mode": "SIMULATION",
+            })
+
+        # Open circuit breaker on IBKR connector if available
+        circuit_tripped = False
+        if bm._ibkr_connector:
+            bm._ibkr_connector._consecutive_failures = failure_count
+            bm._ibkr_connector._circuit_open = True
+            circuit_tripped = True
+
+            # Transition execution state to LIVE_BLOCKED if live
+            if bm._esm.is_live_trading_allowed():
+                bm._esm.block_live(
+                    reason=f"Circuit breaker: {failure_count} consecutive failures simulated",
+                    operator="simulation",
+                )
+
+        if len(bm._rejection_history) > 200:
+            bm._rejection_history = bm._rejection_history[-200:]
+
+        log_event("WARNING", f"[SIMULATION] {failure_count} repeated failures injected", {})
+        return {
+            "simulated": True,
+            "action": "repeated_failures",
+            "failures_injected": failure_count,
+            "circuit_breaker_tripped": circuit_tripped,
+            "current_state": bm._esm.current_state().value,
+            "live_blocked": not bm._esm.is_live_trading_allowed(),
+        }
+    except Exception as e:
+        return {"error": str(e), "simulated": False}
+
+
+# =============================================================================
+# PHASE 9 — VERSION (updated above in /health and below)
+# =============================================================================
+
+@app.get("/api/version")
+async def version():
+    """Return system version and build info."""
+    return {
+        "system": "Apex Multi-Market TJR Engine",
+        "version": "3.0.0",
+        "codename": "IBKR-MULTI-BROKER",
+        "features": [
+            "IBKR TWS/Gateway connector (paper account U25324619)",
+            "Multi-broker routing: OANDA (EURUSD) + IBKR (XAUUSD/Futures/Stocks)",
+            "Autonomous 5-loop scheduler",
+            "8 trading strategies across 5 asset classes",
+            "Full ESM state machine with kill switch",
+            "Risk normaliser: FOREX/FUTURES/STOCKS/CRYPTO",
+            "Fail-closed preflight hard validation",
+        ],
+        "broker_routing": {
+            "EURUSD": "OANDA",
+            "XAUUSD": "IBKR",
+            "Futures (ES/NQ/YM/CL)": "IBKR",
+            "Stocks (AAPL/MSFT/TSLA)": "IBKR",
+            "Indices (US30/US500)": "IBKR",
+            "Unknown": "PAPER_FALLBACK",
+        },
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 # =============================================================================
@@ -1172,7 +1831,7 @@ def _generate_dashboard_html() -> str:
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Apex TJR Engine — Live Dashboard</title>
+<title>Apex TJR Engine v3.0 — Live Dashboard</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">

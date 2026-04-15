@@ -467,7 +467,7 @@ class TestAPIEndpoints:
         r = client.get("/health")
         assert r.status_code == 200
         assert r.json()["status"] == "ok"
-        assert r.json()["version"] == "2.0.0"
+        assert r.json()["version"] == "3.0.0"
 
     def test_status_has_execution_state(self, client):
         r = client.get("/api/status")

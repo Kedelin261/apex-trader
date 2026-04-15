@@ -184,6 +184,125 @@ class CredentialManager:
             logger.info(f"OANDA credentials loaded OK: env={environment} acct={account_id}")
         return creds
 
+    def load_ibkr(self):
+        """
+        Load and validate IBKR TWS/Gateway credentials.
+
+        Environment variables:
+            APEX_IBKR_ACCOUNT_ID   — IBKR account ID (e.g. U25324619)
+            APEX_IBKR_ENVIRONMENT  — practice | live (default: practice)
+            APEX_IBKR_HOST         — TWS host (default: 127.0.0.1)
+            APEX_IBKR_PORT         — TWS port (default: 7497 paper, 7496 live)
+            APEX_IBKR_CLIENT_ID    — EClient client ID (default: 1)
+
+        Returns a credentials-like dataclass (not BrokerCredentials because
+        IBKR uses socket auth, not an API token).
+        """
+        from dataclasses import dataclass as _dc
+
+        @_dc
+        class IBKRCredentials:
+            account_id: str
+            environment: str
+            host: str
+            port: int
+            client_id: int
+            validation_errors: list
+
+            def is_usable(self) -> bool:
+                return bool(self.account_id) and not self.validation_errors
+
+            def safe_summary(self) -> dict:
+                return {
+                    "broker": "ibkr",
+                    "account_id": self.account_id,
+                    "environment": self.environment,
+                    "host": self.host,
+                    "port": self.port,
+                    "client_id": self.client_id,
+                    "errors": self.validation_errors,
+                }
+
+        errors = []
+
+        account_id  = os.environ.get("APEX_IBKR_ACCOUNT_ID", "").strip()
+        environment = os.environ.get("APEX_IBKR_ENVIRONMENT", "practice").strip().lower()
+        host        = os.environ.get("APEX_IBKR_HOST", "127.0.0.1").strip()
+        port_default = "7497" if environment != "live" else "7496"
+        raw_port    = os.environ.get("APEX_IBKR_PORT", port_default).strip()
+        client_id   = int(os.environ.get("APEX_IBKR_CLIENT_ID", "1").strip())
+
+        if not account_id:
+            errors.append("APEX_IBKR_ACCOUNT_ID not set in environment")
+        if environment not in ("practice", "live"):
+            errors.append(
+                f"APEX_IBKR_ENVIRONMENT must be 'practice' or 'live', got '{environment}'"
+            )
+        try:
+            port = int(raw_port)
+        except ValueError:
+            errors.append(f"APEX_IBKR_PORT is not a valid integer: '{raw_port}'")
+            port = int(port_default)
+
+        creds = IBKRCredentials(
+            account_id=account_id,
+            environment=environment,
+            host=host,
+            port=port,
+            client_id=client_id,
+            validation_errors=errors,
+        )
+
+        if errors:
+            logger.warning(f"IBKR credential validation issues: {errors}")
+        else:
+            logger.info(
+                f"IBKR credentials loaded OK: env={environment} "
+                f"acct={account_id} host={host}:{port}"
+            )
+        return creds
+
+    def validate_ibkr_env(self) -> dict:
+        """
+        Validate that all required IBKR environment variables are present.
+
+        Returns:
+            {"valid": True} on success
+            {"valid": False, "error": "IBKR_ENV_NOT_CONFIGURED",
+             "missing": [...], "invalid": [...]} on failure
+        """
+        required = {
+            "APEX_IBKR_ACCOUNT_ID": os.environ.get("APEX_IBKR_ACCOUNT_ID", ""),
+            "APEX_IBKR_ENVIRONMENT": os.environ.get("APEX_IBKR_ENVIRONMENT", ""),
+            "APEX_IBKR_HOST": os.environ.get("APEX_IBKR_HOST", ""),
+            "APEX_IBKR_PORT": os.environ.get("APEX_IBKR_PORT", ""),
+        }
+
+        missing = [k for k, v in required.items() if not v]
+        invalid = []
+
+        env_val = required.get("APEX_IBKR_ENVIRONMENT", "")
+        if env_val and env_val.lower() not in ("practice", "live"):
+            invalid.append(
+                f"APEX_IBKR_ENVIRONMENT='{env_val}' must be 'practice' or 'live'"
+            )
+
+        port_val = required.get("APEX_IBKR_PORT", "")
+        if port_val:
+            try:
+                int(port_val)
+            except ValueError:
+                invalid.append(f"APEX_IBKR_PORT='{port_val}' must be an integer")
+
+        if missing or invalid:
+            return {
+                "valid": False,
+                "error": "IBKR_ENV_NOT_CONFIGURED",
+                "missing": missing,
+                "invalid": invalid,
+            }
+        return {"valid": True}
+
     def load_jwt_secret(self) -> Optional[str]:
         """Load JWT secret for internal API auth."""
         secret = (

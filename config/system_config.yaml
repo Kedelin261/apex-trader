@@ -7,7 +7,7 @@
 
 system:
   name: "Apex Multi-Market TJR Engine"
-  version: "1.0.0"
+  version: "3.0.0"
   environment: "paper"  # Options: backtest | paper | live
   log_level: "INFO"
   timezone: "UTC"
@@ -231,12 +231,16 @@ brokers:
 
   # ── IBKR (XAUUSD, Futures, Stocks, Indices, Commodities) ───────────────────
   ibkr:
-    enabled: false            # Set to true when TWS/Gateway is running
+    enabled: true             # TWS/IB Gateway paper account
     environment: "practice"   # practice | live
-    host: "127.0.0.1"
+    host: "127.0.0.1"         # Set via APEX_IBKR_HOST env var
     port: 7497                # 7497=TWS paper, 7496=TWS live, 4002=Gateway paper, 4001=Gateway live
-    client_id: 1
-    # Credentials: set APEX_IBKR_ACCOUNT_ID and APEX_IBKR_ENVIRONMENT in .env
+    client_id: 1              # Set via APEX_IBKR_CLIENT_ID env var
+    # Credentials loaded from environment variables:
+    #   APEX_IBKR_ACCOUNT_ID   = U25324619
+    #   APEX_IBKR_ENVIRONMENT  = practice
+    #   APEX_IBKR_HOST         = 127.0.0.1
+    #   APEX_IBKR_PORT         = 7497
     futures_expiry: "202506"  # Update quarterly — front month YYYYMM
     routes:
       # Gold / Precious Metals (via Futures at IBKR)

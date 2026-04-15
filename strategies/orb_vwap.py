@@ -292,3 +292,6 @@ class ORBWithVWAP(BaseStrategy):
             if t_min >= start:
                 result.append(c)
         return result
+
+# Alias for backward compatibility
+ORBVWAPStrategy = ORBWithVWAP
