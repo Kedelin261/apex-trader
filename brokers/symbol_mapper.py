@@ -107,6 +107,53 @@ _OANDA_MAP: Dict[str, tuple] = {
 # Brokers that have no mapping for certain instruments
 _OANDA_UNSUPPORTED: frozenset[str] = frozenset()
 
+# ---------------------------------------------------------------------------
+# IBKR STATIC MAP (canonical → (broker_native, asset_class))
+# Mirrors IBKR_CONTRACT_MAP in ibkr_connector.py
+# ---------------------------------------------------------------------------
+_IBKR_MAP: Dict[str, tuple] = {
+    # Gold / Futures
+    "XAUUSD":  ("GC",     "FUTURES"),
+    "GC":      ("GC",     "FUTURES"),
+    "XAGUSD":  ("SI",     "FUTURES"),
+    "ES":      ("ES",     "FUTURES"),
+    "NQ":      ("NQ",     "FUTURES"),
+    "YM":      ("YM",     "FUTURES"),
+    "CL":      ("CL",     "FUTURES"),
+    # Stocks
+    "AAPL":    ("AAPL",   "STOCKS"),
+    "MSFT":    ("MSFT",   "STOCKS"),
+    "TSLA":    ("TSLA",   "STOCKS"),
+    "NVDA":    ("NVDA",   "STOCKS"),
+    "SPY":     ("SPY",    "STOCKS"),
+    "QQQ":     ("QQQ",    "STOCKS"),
+    "AMZN":    ("AMZN",   "STOCKS"),
+    "GOOGL":   ("GOOGL",  "STOCKS"),
+    "META":    ("META",   "STOCKS"),
+    # Indices
+    "US30":    ("INDU",   "INDICES"),
+    "US500":   ("SPX",    "INDICES"),
+    "NAS100":  ("NDX",    "INDICES"),
+    "GER40":   ("DAX",    "INDICES"),
+    "UK100":   ("UKX",    "INDICES"),
+    # Commodities
+    "USOIL":   ("CL",     "COMMODITIES"),
+    "UKOIL":   ("BRN",    "COMMODITIES"),
+    "NATGAS":  ("NG",     "COMMODITIES"),
+    "COPPER":  ("HG",     "COMMODITIES"),
+    # Non-EURUSD Forex
+    "GBPUSD":  ("GBP",    "FOREX"),
+    "USDJPY":  ("USD",    "FOREX"),
+    "AUDUSD":  ("AUD",    "FOREX"),
+    "USDCAD":  ("USD",    "FOREX"),
+    "USDCHF":  ("USD",    "FOREX"),
+    "NZDUSD":  ("NZD",    "FOREX"),
+    "EURJPY":  ("EUR",    "FOREX"),
+    "GBPJPY":  ("GBP",    "FOREX"),
+}
+
+_IBKR_UNSUPPORTED: frozenset = frozenset({"EURUSD"})  # EURUSD routes to OANDA not IBKR
+
 
 class BrokerSymbolMapper:
     """
@@ -139,6 +186,9 @@ class BrokerSymbolMapper:
         if self._broker_name == "oanda":
             self._static_map = _OANDA_MAP
             self._unsupported = _OANDA_UNSUPPORTED
+        elif self._broker_name == "ibkr":
+            self._static_map = _IBKR_MAP
+            self._unsupported = _IBKR_UNSUPPORTED
         else:
             self._static_map = {}
             self._unsupported = frozenset()

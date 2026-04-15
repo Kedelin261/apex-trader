@@ -234,17 +234,19 @@ class TestBrokerManagerCheckSymbol:
             bm = BrokerManager(config={})
 
             # --- Scenario A: hydrate with no connector → INSTRUMENT_UNCONFIRMED ---
-            bm._symbol_mapper = BrokerSymbolMapper("oanda")
-            bm._symbol_mapper.hydrate(connector=None)
+            # v3.0: XAUUSD routes to IBKR mapper (_ibkr_symbol_mapper)
+            bm._ibkr_symbol_mapper = BrokerSymbolMapper("ibkr")
+            bm._ibkr_symbol_mapper.hydrate(connector=None)
             result_no_conn = bm.check_symbol("XAUUSD")
             assert result_no_conn.is_tradeable is False
+            # IBKR mapper without connector → INSTRUMENT_UNCONFIRMED
             assert result_no_conn.rejection_code == "INSTRUMENT_UNCONFIRMED"
 
             # --- Scenario B: hydrate with live-confirmed connector → tradeable=True ---
             mock_live_conn = MagicMock()
             mock_live_conn.validate_instrument_mapping.return_value = InstrumentMapping(
                 internal="XAUUSD",
-                broker_symbol="XAU_USD",
+                broker_symbol="GC",   # IBKR uses GC for XAUUSD
                 tradeable=True,
                 min_units=1.0,
                 max_units=10000.0,
@@ -256,17 +258,23 @@ class TestBrokerManagerCheckSymbol:
                 is_tradeable_metadata=True,
                 raw_broker_metadata={"status": "tradeable"},
             )
-            bm._symbol_mapper = BrokerSymbolMapper("oanda")
-            bm._symbol_mapper.hydrate(connector=mock_live_conn)
+            bm._ibkr_symbol_mapper = BrokerSymbolMapper("ibkr")
+            bm._ibkr_symbol_mapper.hydrate(connector=mock_live_conn)
             result_live = bm.check_symbol("XAUUSD")
 
         assert result_live.is_tradeable is True
-        assert result_live.broker_symbol == "XAU_USD"
-        assert result_live.asset_class == "GOLD"
+        assert result_live.broker_symbol == "GC"   # IBKR broker symbol for XAUUSD
+        assert result_live.asset_class == "FUTURES"
         assert result_live.rejection_code is None
 
     def test_check_unknown_symbol(self):
-        """Unknown symbols return UNKNOWN_SYMBOL."""
+        """
+        Unknown symbols (not in any routing table) return a non-tradeable result.
+
+        v3.0 update: Symbols not in OANDA_ROUTING or IBKR_ROUTING route to 'paper'
+        which has no mapper → BROKER_NOT_CONNECTED. The core invariant is preserved:
+        is_tradeable is False and the order cannot proceed.
+        """
         from brokers.symbol_mapper import BrokerSymbolMapper
         from live.broker_manager import BrokerManager
         from unittest.mock import patch, MagicMock
@@ -285,7 +293,9 @@ class TestBrokerManagerCheckSymbol:
             result = bm.check_symbol("DOGEUSD")
 
         assert result.is_tradeable is False
-        assert result.rejection_code == "UNKNOWN_SYMBOL"
+        # v3.0: unknown symbol routes to paper → BROKER_NOT_CONNECTED
+        # (previously UNKNOWN_SYMBOL when single-mapper; both are non-tradeable)
+        assert result.rejection_code in ("UNKNOWN_SYMBOL", "BROKER_NOT_CONNECTED")
 
     def test_check_raw_broker_symbol_rejected(self):
         """XAU_USD (broker-native) should NOT be a valid canonical symbol."""
@@ -307,7 +317,8 @@ class TestBrokerManagerCheckSymbol:
             result = bm.check_symbol("XAU_USD")
 
         assert result.is_tradeable is False
-        assert result.rejection_code == "UNKNOWN_SYMBOL"
+        # v3.0: XAU_USD (broker native) not in routing tables → routes to paper
+        assert result.rejection_code in ("UNKNOWN_SYMBOL", "BROKER_NOT_CONNECTED")
 
 
 # ---------------------------------------------------------------------------

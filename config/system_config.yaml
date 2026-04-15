@@ -218,7 +218,66 @@ agents:
 # BROKER / EXCHANGE CONFIGURATION
 # =============================================================================
 brokers:
-  default: "paper"  # paper | tradovate | forex_broker | ccxt
+  default: "paper"  # paper | oanda | ibkr | both
+
+  # ── OANDA (EURUSD exclusively) ──────────────────────────────────────────────
+  oanda:
+    enabled: true
+    environment: "practice"   # practice | live
+    # Credentials: set APEX_OANDA_API_TOKEN and APEX_OANDA_ACCOUNT_ID in .env
+    routes:
+      - EURUSD
+    # All other forex pairs, gold, futures → IBKR
+
+  # ── IBKR (XAUUSD, Futures, Stocks, Indices, Commodities) ───────────────────
+  ibkr:
+    enabled: false            # Set to true when TWS/Gateway is running
+    environment: "practice"   # practice | live
+    host: "127.0.0.1"
+    port: 7497                # 7497=TWS paper, 7496=TWS live, 4002=Gateway paper, 4001=Gateway live
+    client_id: 1
+    # Credentials: set APEX_IBKR_ACCOUNT_ID and APEX_IBKR_ENVIRONMENT in .env
+    futures_expiry: "202506"  # Update quarterly — front month YYYYMM
+    routes:
+      # Gold / Precious Metals (via Futures at IBKR)
+      - XAUUSD
+      - GC
+      - XAGUSD
+      # Equity Futures
+      - ES
+      - NQ
+      - YM
+      - CL
+      # Stocks
+      - AAPL
+      - MSFT
+      - TSLA
+      - NVDA
+      - SPY
+      - QQQ
+      - AMZN
+      - GOOGL
+      - META
+      # Indices
+      - US30
+      - US500
+      - NAS100
+      - GER40
+      - UK100
+      # Commodities
+      - USOIL
+      - UKOIL
+      - NATGAS
+      - COPPER
+      # Non-EURUSD Forex
+      - GBPUSD
+      - USDJPY
+      - AUDUSD
+      - USDCAD
+      - USDCHF
+      - NZDUSD
+      - EURJPY
+      - GBPJPY
 
   tradovate:
     enabled: false
