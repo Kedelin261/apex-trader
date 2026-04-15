@@ -22,7 +22,7 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
 
@@ -124,8 +124,7 @@ class AgentMessage(BaseModel):
     # Chain tracking
     parent_message_id: Optional[str] = None  # Links this message to its cause
 
-    class Config:
-        frozen = False   # Allow field updates for status tracking
+    model_config = ConfigDict(frozen=False)   # Allow field updates for status tracking
 
     def to_log_dict(self) -> dict:
         return {
