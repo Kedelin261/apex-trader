@@ -1822,6 +1822,484 @@ async def version():
 
 
 # =============================================================================
+# PHASE 10-12 — ROLLOUT MODE, RISK GOVERNOR, ALLOCATOR, ALERTS ENDPOINTS
+# =============================================================================
+
+# Singletons for phase 10-12 components
+_rollout_mode_manager = None
+_risk_governor_instance = None
+_portfolio_allocator_instance = None
+_alert_dispatcher_instance = None
+
+
+def get_alert_dispatcher():
+    global _alert_dispatcher_instance
+    if _alert_dispatcher_instance is None:
+        try:
+            from live.alert_dispatcher import AlertDispatcher
+            _alert_dispatcher_instance = AlertDispatcher(CONFIG)
+        except Exception as e:
+            logger.warning(f"AlertDispatcher init failed: {e}")
+    return _alert_dispatcher_instance
+
+
+def get_risk_governor():
+    global _risk_governor_instance
+    if _risk_governor_instance is None:
+        try:
+            from live.risk_governor import RiskGovernor
+            bm = get_broker_manager()
+            esm = getattr(bm, "_esm", None)
+            _risk_governor_instance = RiskGovernor(
+                CONFIG, esm=esm, alert_dispatcher=get_alert_dispatcher()
+            )
+        except Exception as e:
+            logger.warning(f"RiskGovernor init failed: {e}")
+    return _risk_governor_instance
+
+
+def get_portfolio_allocator():
+    global _portfolio_allocator_instance
+    if _portfolio_allocator_instance is None:
+        try:
+            from live.portfolio_allocator import PortfolioAllocator
+            _portfolio_allocator_instance = PortfolioAllocator(CONFIG)
+        except Exception as e:
+            logger.warning(f"PortfolioAllocator init failed: {e}")
+    return _portfolio_allocator_instance
+
+
+def get_rollout_mode_manager():
+    global _rollout_mode_manager
+    if _rollout_mode_manager is None:
+        try:
+            from live.rollout_mode_manager import RolloutModeManager
+            bm = get_broker_manager()
+            _rollout_mode_manager = RolloutModeManager(
+                CONFIG,
+                esm=getattr(bm, "_esm", None),
+                alert_dispatcher=get_alert_dispatcher(),
+                risk_governor=get_risk_governor(),
+                persistence_manager=None,   # lazy — persistence manager starts with scheduler
+            )
+        except Exception as e:
+            logger.warning(f"RolloutModeManager init failed: {e}")
+    return _rollout_mode_manager
+
+
+# --------------------------------------------------------------------------
+# /api/system/mode — rollout mode management (Phase 11)
+# --------------------------------------------------------------------------
+
+class SetModeRequest(BaseModel):
+    mode: str
+    operator: str = "api"
+    reason: str = ""
+
+
+@app.get("/api/system/mode")
+async def get_system_mode():
+    """Return current rollout mode and gate status for UNATTENDED_LIVE_MODE."""
+    try:
+        rmm = get_rollout_mode_manager()
+        if rmm is None:
+            return {"error": "RolloutModeManager not available", "mode": "UNATTENDED_PAPER_MODE"}
+        return rmm.status()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/system/mode")
+async def set_system_mode(req: SetModeRequest):
+    """
+    Change the rollout mode.
+
+    Modes:
+      MANUAL_SIGNAL_MODE        — signals only via /api/signal; scheduler off
+      SUPERVISED_AUTONOMY_MODE  — scheduler on; every order needs operator ACK
+      UNATTENDED_PAPER_MODE     — scheduler on; orders go to paper broker
+      UNATTENDED_LIVE_MODE      — scheduler on; orders go to live broker (requires gate)
+    """
+    try:
+        from live.rollout_mode_manager import RolloutMode
+        try:
+            new_mode = RolloutMode(req.mode)
+        except ValueError:
+            return {
+                "success": False,
+                "error": f"Unknown mode {req.mode!r}. Valid: {[m.value for m in RolloutMode]}",
+            }
+
+        rmm = get_rollout_mode_manager()
+        if rmm is None:
+            return {"success": False, "error": "RolloutModeManager not available"}
+
+        ok, msg = rmm.set_mode(new_mode, operator=req.operator, reason=req.reason)
+        log_event(
+            "INFO" if ok else "WARNING",
+            f"Rollout mode change: {req.mode} {'OK' if ok else 'FAILED'}",
+            {"operator": req.operator, "reason": req.reason},
+        )
+        return {"success": ok, "message": msg, "mode": rmm.mode.value}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/api/system/mode/live-gate")
+async def get_live_gate_status():
+    """Return detailed UNATTENDED_LIVE_MODE gate check results."""
+    try:
+        rmm = get_rollout_mode_manager()
+        if rmm is None:
+            return {"error": "RolloutModeManager not available"}
+        ok, reason = rmm.check_live_gate()
+        return {
+            "gate_passed": ok,
+            "reason": reason if not ok else "All gate checks passed",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# --------------------------------------------------------------------------
+# /api/system/mode/approvals — supervised mode ACK queue (Phase 11)
+# --------------------------------------------------------------------------
+
+@app.get("/api/system/mode/approvals")
+async def get_pending_approvals():
+    """Return signals pending operator approval (SUPERVISED_AUTONOMY_MODE)."""
+    try:
+        rmm = get_rollout_mode_manager()
+        if rmm is None:
+            return {"pending": [], "count": 0}
+        pending = rmm.get_pending_approvals()
+        return {"pending": pending, "count": len(pending)}
+    except Exception as e:
+        return {"error": str(e), "pending": []}
+
+
+@app.post("/api/system/mode/approve/{queue_id}")
+async def approve_signal(queue_id: str, operator: str = "api"):
+    """Approve a queued signal in SUPERVISED_AUTONOMY_MODE."""
+    try:
+        rmm = get_rollout_mode_manager()
+        if rmm is None:
+            return {"success": False, "error": "Not in supervised mode"}
+        ok, item = rmm.approve_signal(queue_id, operator)
+        return {"success": ok, "item": item}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/system/mode/reject/{queue_id}")
+async def reject_signal_api(queue_id: str, operator: str = "api", reason: str = ""):
+    """Reject a queued signal in SUPERVISED_AUTONOMY_MODE."""
+    try:
+        rmm = get_rollout_mode_manager()
+        if rmm is None:
+            return {"success": False, "error": "Not in supervised mode"}
+        ok = rmm.reject_signal(queue_id, operator, reason)
+        return {"success": ok}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# --------------------------------------------------------------------------
+# /api/risk/governor — risk governor status & control (Phase 3/12)
+# --------------------------------------------------------------------------
+
+@app.get("/api/risk/governor")
+async def risk_governor_status():
+    """Return full Risk Governor status: daily PnL, drawdown, kill state, limits."""
+    try:
+        # Prefer scheduler's governor if running, else standalone
+        sched = None
+        try:
+            sched = get_scheduler()
+        except Exception:
+            pass
+
+        rg = None
+        if sched:
+            rg = sched._get_risk_governor()
+        if rg is None:
+            rg = get_risk_governor()
+        if rg is None:
+            return {"error": "RiskGovernor not initialised"}
+        return rg.status()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/risk/governor/reset-kill")
+async def risk_governor_reset_kill(body: ControlCommand):
+    """Reset risk governor kill switch (operator action required)."""
+    try:
+        rg = None
+        try:
+            sched = get_scheduler()
+            rg = sched._get_risk_governor()
+        except Exception:
+            pass
+        if rg is None:
+            rg = get_risk_governor()
+        if rg is None:
+            return {"success": False, "error": "RiskGovernor not initialised"}
+        rg.reset_kill_switch(operator=body.operator)
+        log_event("WARNING", f"RiskGovernor kill switch reset by {body.operator}", {})
+        return {"success": True, "message": "Kill switch reset"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/risk/governor/reset-daily")
+async def risk_governor_reset_daily(body: ControlCommand):
+    """Reset daily risk counters (operator action required)."""
+    try:
+        rg = None
+        try:
+            sched = get_scheduler()
+            rg = sched._get_risk_governor()
+        except Exception:
+            pass
+        if rg is None:
+            rg = get_risk_governor()
+        if rg is None:
+            return {"success": False, "error": "RiskGovernor not initialised"}
+        rg.reset_daily_state(operator=body.operator)
+        log_event("INFO", f"RiskGovernor daily state reset by {body.operator}", {})
+        return {"success": True, "message": "Daily state reset"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# --------------------------------------------------------------------------
+# /api/portfolio/allocator — allocator status & control (Phase 4/12)
+# --------------------------------------------------------------------------
+
+@app.get("/api/portfolio/allocator")
+async def portfolio_allocator_status():
+    """Return Portfolio Allocator state: budgets, per-strategy usage, open counts."""
+    try:
+        alloc = None
+        try:
+            sched = get_scheduler()
+            alloc = sched._get_portfolio_allocator()
+        except Exception:
+            pass
+        if alloc is None:
+            alloc = get_portfolio_allocator()
+        if alloc is None:
+            return {"error": "PortfolioAllocator not initialised"}
+        return alloc.status()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+class StrategyEnableRequest(BaseModel):
+    strategy: str
+    enabled: bool
+    operator: str = "api"
+
+
+@app.post("/api/portfolio/allocator/strategy")
+async def set_strategy_enabled(req: StrategyEnableRequest):
+    """Enable or disable a strategy in the Portfolio Allocator."""
+    try:
+        alloc = None
+        try:
+            sched = get_scheduler()
+            alloc = sched._get_portfolio_allocator()
+        except Exception:
+            pass
+        if alloc is None:
+            alloc = get_portfolio_allocator()
+        if alloc is None:
+            return {"success": False, "error": "PortfolioAllocator not initialised"}
+        alloc.enable_strategy(req.strategy, req.enabled)
+        log_event(
+            "INFO",
+            f"Strategy {req.strategy!r} {'enabled' if req.enabled else 'disabled'} by {req.operator}",
+            {},
+        )
+        return {
+            "success": True,
+            "strategy": req.strategy,
+            "enabled": req.enabled,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# --------------------------------------------------------------------------
+# /api/system/alerts — alert history and config (Phase 7/12)
+# --------------------------------------------------------------------------
+
+@app.get("/api/system/alerts")
+async def get_recent_alerts(limit: int = 50):
+    """Return recent alert events from the AlertDispatcher."""
+    try:
+        alert = get_alert_dispatcher()
+        if alert is None:
+            return {"alerts": [], "count": 0}
+        recent = alert.get_recent_alerts(limit=limit)
+        return {
+            "alerts": [
+                {
+                    "type": a.alert_type,
+                    "message": a.message,
+                    "level": a.level,
+                    "timestamp": a.timestamp,
+                    "details": a.details,
+                }
+                for a in recent
+            ],
+            "count": len(recent),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        return {"error": str(e), "alerts": []}
+
+
+@app.get("/api/system/health")
+async def system_health_full():
+    """
+    Comprehensive system health: scheduler loops, broker health,
+    risk governor, allocator, rollout mode, persistence.
+    """
+    try:
+        health: dict = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "system_version": "3.0.0",
+        }
+
+        # Scheduler + loops
+        try:
+            sched = get_scheduler()
+            sched_status = sched.status()
+            health["scheduler"] = {
+                "running": sched_status.get("running", False),
+                "cycle_count": sched_status.get("cycle_count", 0),
+                "active_threads": sched_status.get("active_threads", 0),
+                "loop_failures": sched_status.get("loop_failures", {}),
+                "heartbeats": sched_status.get("heartbeats", {}),
+            }
+        except Exception as e:
+            health["scheduler"] = {"error": str(e)}
+
+        # Broker health from supervisor
+        try:
+            sched = get_scheduler()
+            health["broker_health"] = sched_status.get("broker_health", {})
+        except Exception:
+            health["broker_health"] = {}
+
+        # ESM state
+        try:
+            bm = get_broker_manager()
+            snap = bm._esm.snapshot()
+            health["execution_state"] = {
+                "state": snap.state,
+                "broker": snap.broker,
+                "environment": snap.environment,
+                "kill_switch": snap.kill_switch_active,
+                "live_trading_allowed": bm._esm.is_live_trading_allowed(),
+            }
+        except Exception as e:
+            health["execution_state"] = {"error": str(e)}
+
+        # Risk governor
+        try:
+            rg_status = await risk_governor_status()
+            health["risk_governor"] = {
+                "kill_active": rg_status.get("global_kill_active", False),
+                "daily_loss_pct": rg_status.get("daily", {}).get("loss_used_pct", 0),
+                "drawdown_pct": rg_status.get("drawdown_pct", 0),
+                "cooldown_active": rg_status.get("cooldown_active", False),
+            }
+        except Exception as e:
+            health["risk_governor"] = {"error": str(e)}
+
+        # Rollout mode
+        try:
+            rmm = get_rollout_mode_manager()
+            health["rollout_mode"] = rmm.status() if rmm else {"mode": "UNKNOWN"}
+        except Exception as e:
+            health["rollout_mode"] = {"error": str(e)}
+
+        # Overall health verdict
+        issues = []
+        sched_ok = health.get("scheduler", {}).get("running", False)
+        if not sched_ok:
+            issues.append("scheduler_not_running")
+        rg_kill = health.get("risk_governor", {}).get("kill_active", False)
+        if rg_kill:
+            issues.append("risk_governor_kill_active")
+        esm_kill = health.get("execution_state", {}).get("kill_switch", False)
+        if esm_kill:
+            issues.append("kill_switch_engaged")
+
+        health["overall"] = "HEALTHY" if not issues else "DEGRADED"
+        health["issues"] = issues
+
+        return health
+
+    except Exception as e:
+        return {"error": str(e), "overall": "ERROR"}
+
+
+# --------------------------------------------------------------------------
+# /api/broker/heartbeat — broker supervisor status (Phase 5/12)
+# --------------------------------------------------------------------------
+
+@app.get("/api/broker/heartbeat")
+async def broker_heartbeat_status():
+    """Return broker supervisor health and heartbeat timestamps."""
+    try:
+        sched = None
+        try:
+            sched = get_scheduler()
+        except Exception:
+            pass
+        if sched:
+            sup = sched._get_broker_supervisor()
+            if sup:
+                return sup.get_health()
+        return {
+            "oanda": {"connected": False, "note": "Scheduler not running"},
+            "ibkr": {"connected": False, "note": "Scheduler not running"},
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# --------------------------------------------------------------------------
+# /api/positions/actions — position manager recent actions (Phase 2/12)
+# --------------------------------------------------------------------------
+
+@app.get("/api/positions/actions")
+async def get_position_actions():
+    """Return recent position management actions (SL moves, closes, cancels)."""
+    try:
+        sched = None
+        try:
+            sched = get_scheduler()
+        except Exception:
+            pass
+        if sched:
+            pm_mgr = sched._get_position_manager()
+            if pm_mgr:
+                return {
+                    "actions": pm_mgr.get_recent_actions(),
+                    "status": pm_mgr.status(),
+                }
+        return {"actions": [], "status": {}}
+    except Exception as e:
+        return {"error": str(e), "actions": []}
+
+
+# =============================================================================
 # DASHBOARD HTML
 # =============================================================================
 

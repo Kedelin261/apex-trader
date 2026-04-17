@@ -347,3 +347,224 @@ news_filter:
   impact_levels: ["HIGH"]   # Block on HIGH impact only, or add "MEDIUM"
   source: "forexfactory"    # forexfactory | investing | manual
   calendar_file: "data/economic_calendar.json"
+
+# =============================================================================
+# DATA / STATE PERSISTENCE DIRECTORIES
+# =============================================================================
+data:
+  state_dir: "data"
+  logs_dir: "logs"
+  historical_dir: "data/historical"
+
+# =============================================================================
+# AUTONOMY — All operational values for fully autonomous operation
+# =============================================================================
+autonomy:
+
+  # --------------------------------------------------------------------------
+  # Runtime rollout mode (Phase 11)
+  # --------------------------------------------------------------------------
+  rollout_mode: "UNATTENDED_PAPER_MODE"
+  # Allowed values:
+  #   MANUAL_SIGNAL_MODE        — scheduler disabled; signals only from /api/signal
+  #   SUPERVISED_AUTONOMY_MODE  — scheduler runs, every order requires operator ack
+  #   UNATTENDED_PAPER_MODE     — scheduler runs, orders go to paper broker (default)
+  #   UNATTENDED_LIVE_MODE      — scheduler runs, orders go to live broker
+  #                               (requires: connected + preflight + armed + alerts + risk_governor + persistence)
+
+  # --------------------------------------------------------------------------
+  # Scheduler loop intervals (seconds)
+  # --------------------------------------------------------------------------
+  scheduler:
+    market_data_interval_s: 30
+    strategy_scan_interval_s: 30
+    position_monitor_interval_s: 10
+    reconciliation_interval_s: 60
+    health_monitor_interval_s: 30
+    signal_process_interval_s: 5
+
+  # --------------------------------------------------------------------------
+  # Signal deduplication cache
+  # --------------------------------------------------------------------------
+  signal_dedup_cache_hours: 24.0   # Keep submitted signal IDs for N hours
+
+  # --------------------------------------------------------------------------
+  # Risk Governor (Phase 3 — hard caps for unattended operation)
+  # --------------------------------------------------------------------------
+  risk_governor:
+    max_trades_per_day: 20
+    max_positions_per_symbol: 2
+    max_positions_per_strategy: 3
+    max_exposure_per_asset_class_usd: 50000.0
+    max_correlated_exposure_usd: 30000.0
+    cooldown_after_consecutive_losses: 3
+    cooldown_minutes: 60
+    kill_after_broker_rejects: 10
+    kill_on_reconciliation_mismatch: true
+    kill_on_stale_data_minutes: 5
+
+  # --------------------------------------------------------------------------
+  # Portfolio Allocator (Phase 4)
+  # --------------------------------------------------------------------------
+  portfolio_allocator:
+    total_daily_risk_budget_usd: 3000.0    # 3% of 100k default account
+    strategies:
+      asian_range_breakout:
+        enabled: true
+        priority: 2
+        max_risk_budget_pct: 25.0
+        max_concurrent_positions: 2
+      orb_vwap:
+        enabled: true
+        priority: 3
+        max_risk_budget_pct: 20.0
+        max_concurrent_positions: 2
+      vwap_sd_reversion:
+        enabled: true
+        priority: 4
+        max_risk_budget_pct: 15.0
+        max_concurrent_positions: 2
+      commodity_trend:
+        enabled: true
+        priority: 5
+        max_risk_budget_pct: 15.0
+        max_concurrent_positions: 2
+      gap_and_go:
+        enabled: true
+        priority: 3
+        max_risk_budget_pct: 20.0
+        max_concurrent_positions: 2
+      crypto_funding_reversion:
+        enabled: false     # disabled until crypto credentials provided
+        priority: 7
+        max_risk_budget_pct: 10.0
+        max_concurrent_positions: 1
+      crypto_monday_range:
+        enabled: false
+        priority: 8
+        max_risk_budget_pct: 10.0
+        max_concurrent_positions: 1
+      prediction_market_arb:
+        enabled: false
+        priority: 9
+        max_risk_budget_pct: 5.0
+        max_concurrent_positions: 1
+
+  # --------------------------------------------------------------------------
+  # Broker Supervisor (Phase 5 — heartbeat & reconnect policy)
+  # --------------------------------------------------------------------------
+  broker_supervisor:
+    heartbeat_interval_seconds: 30
+    max_reconnect_attempts: 5
+    backoff_base_seconds: 10
+    backoff_max_seconds: 300
+    failure_downgrade_threshold: 3     # consecutive failures before ESM block
+
+  # --------------------------------------------------------------------------
+  # Position Management Rules (Phase 2)
+  # --------------------------------------------------------------------------
+  position_management:
+    default_max_hold_hours: 48.0
+    default_be_trigger_r: 1.0          # Move SL to BE when price is 1R in profit
+    default_trailing_enabled: false
+    default_trailing_step_pips: 10.0
+    default_session_close_exit: true
+    default_max_weekend_hold: false
+    default_stale_order_minutes: 30.0
+    market_close_utc_hour: 21          # Friday 21:00 UTC = pre-weekend exit
+    weekend_exit_enabled: true
+    per_strategy:
+      asian_range_breakout:
+        max_hold_hours: 24.0
+        be_trigger_r: 1.0
+        trailing_enabled: false
+        session_close_exit: true
+      orb_vwap:
+        max_hold_hours: 8.0
+        be_trigger_r: 1.0
+        trailing_enabled: true
+        trailing_step_pips: 15.0
+        session_close_exit: true
+      vwap_sd_reversion:
+        max_hold_hours: 12.0
+        be_trigger_r: 1.0
+        trailing_enabled: false
+        session_close_exit: true
+      commodity_trend:
+        max_hold_hours: 72.0
+        be_trigger_r: 1.5
+        trailing_enabled: true
+        trailing_step_pips: 20.0
+        session_close_exit: false
+      gap_and_go:
+        max_hold_hours: 6.0
+        be_trigger_r: 1.0
+        trailing_enabled: false
+        session_close_exit: true
+
+  # --------------------------------------------------------------------------
+  # Alerting (Phase 7)
+  # --------------------------------------------------------------------------
+  alerting:
+    enabled: true
+    min_level: "INFO"      # Only emit alerts at this level or above
+    console_always: true   # Console log always active
+
+    # Alert types to enable (subset of all types)
+    enabled_types:
+      - "BROKER_CONNECTED"
+      - "BROKER_DISCONNECTED"
+      - "TRADE_OPENED"
+      - "TRADE_CLOSED"
+      - "STOP_MOVED"
+      - "RISK_LIMIT_HIT"
+      - "SYSTEM_BLOCKED"
+      - "LOOP_FAILURE"
+      - "RESTART_DETECTED"
+      - "RECONCILIATION_MISMATCH"
+      - "REPEATED_REJECTS"
+      - "STALE_DATA"
+      - "DRAWDOWN_WARNING"
+      - "DAILY_SUMMARY"
+
+    # Email adapter (set credentials in .env / .dev.vars, never here)
+    email:
+      enabled: false       # Set to true after configuring credentials
+      smtp_host: ""        # Set APEX_SMTP_HOST in .env
+      smtp_port: 587
+      smtp_use_tls: true
+      from_address: ""     # Set APEX_SMTP_FROM in .env
+      to_addresses: []     # Set APEX_ALERT_EMAIL_TO in .env (comma-separated)
+      # smtp_user and smtp_password: set APEX_SMTP_USER and APEX_SMTP_PASSWORD in .env
+
+    # Telegram adapter
+    telegram:
+      enabled: false       # Set to true after providing bot token
+      # bot_token: set APEX_TELEGRAM_BOT_TOKEN in .env
+      # chat_id:   set APEX_TELEGRAM_CHAT_ID in .env
+
+    # Discord adapter
+    discord:
+      enabled: false       # Set to true after providing webhook URL
+      # webhook_url: set APEX_DISCORD_WEBHOOK_URL in .env
+
+  # --------------------------------------------------------------------------
+  # Market hours / shutdown windows
+  # --------------------------------------------------------------------------
+  market_hours:
+    forex_sessions_utc:
+      london:  {start: "07:00", end: "16:00"}
+      new_york: {start: "13:00", end: "22:00"}
+      overlap:  {start: "13:00", end: "16:00"}
+      asian:    {start: "00:00", end: "08:00"}
+    weekend_halt_utc:
+      friday_cutoff: "21:00"       # No new entries after this on Friday
+      sunday_resume: "21:00"       # Resume from this time on Sunday
+
+  # --------------------------------------------------------------------------
+  # Health thresholds for monitoring endpoints
+  # --------------------------------------------------------------------------
+  health_thresholds:
+    loop_stale_seconds: 120        # Loop is stale if heartbeat > N seconds old
+    data_stale_minutes: 5          # Market data stale threshold
+    broker_latency_warn_ms: 2000   # Warn if broker round-trip > N ms

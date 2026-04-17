@@ -487,7 +487,7 @@ class TestPhase3ExecutionStateMachine:
 # ============================================================================
 
 class TestPhase4AutonomousScheduler:
-    """Verify all 5 scheduler loops load and start correctly."""
+    """Verify all 6 scheduler loops load and start correctly."""
 
     def test_scheduler_initialises(self):
         from live.autonomous_scheduler import AutonomousScheduler
@@ -523,9 +523,9 @@ class TestPhase4AutonomousScheduler:
             import time
             time.sleep(0.1)  # Let threads spin up
             assert sched._running is True
-            assert len(sched._threads) == 5
+            assert len(sched._threads) == 6
             alive = sum(1 for t in sched._threads if t.is_alive())
-            assert alive == 5, f"Expected 5 alive threads, got {alive}"
+            assert alive == 6, f"Expected 6 alive threads, got {alive}"
         finally:
             sched.stop()
 
@@ -548,7 +548,7 @@ class TestPhase4AutonomousScheduler:
         sched.stop()
         assert sched._running is False
 
-    def test_all_5_loop_names_present_in_threads(self):
+    def test_all_6_loop_names_present_in_threads(self):
         from live.autonomous_scheduler import AutonomousScheduler
         import time
 
@@ -572,6 +572,7 @@ class TestPhase4AutonomousScheduler:
                 "signal-process-loop",
                 "position-monitor-loop",
                 "reconciliation-loop",
+                "health-monitor-loop",
             }
             assert expected == thread_names, (
                 f"Thread name mismatch. Expected {expected}, got {thread_names}"

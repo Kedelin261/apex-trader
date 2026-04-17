@@ -1,0 +1,51 @@
+# =============================================================================
+# APEX MULTI-MARKET TJR ENGINE — systemd Unit File
+# Phase 8: Always-On Process Management (VPS deployment)
+#
+# Installation:
+#   sudo cp scripts/apex-trader.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable apex-trader
+#   sudo systemctl start apex-trader
+#
+# Management:
+#   sudo systemctl status apex-trader
+#   sudo journalctl -u apex-trader -f
+#   sudo systemctl restart apex-trader
+#   sudo systemctl stop apex-trader
+# =============================================================================
+
+[Unit]
+Description=Apex Multi-Market TJR Engine — Autonomous Trading System
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu                          # Change to your VPS user
+WorkingDirectory=/home/ubuntu/apex-trader    # Change to your deploy path
+ExecStart=/usr/bin/python3 live/api_server.py
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/home/ubuntu/apex-trader
+EnvironmentFile=/home/ubuntu/apex-trader/.env    # Load secrets from .env
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=2G
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=apex-trader
+
+# Graceful shutdown: give process 15s to clean up before SIGKILL
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
