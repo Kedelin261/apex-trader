@@ -37,16 +37,18 @@ class ReconciliationService:
     def __init__(
         self,
         connector,         # BaseBrokerConnector
-        orchestrator,      # AgentOrchestrator (for open positions)
+        orchestrator,      # AgentOrchestrator (for open positions, legacy path)
         state_machine,     # ExecutionStateMachine
         log_path: str = "logs/reconciliation_log.jsonl",
         interval_seconds: int = 60,
         auto_block_on_mismatch: bool = True,
         mismatch_threshold_usd: float = 100.0,
+        scheduler=None,    # AutonomousScheduler (primary position source)
     ):
         self._connector = connector
         self._orchestrator = orchestrator
         self._esm = state_machine
+        self._scheduler = scheduler   # preferred source of truth for positions
         self._log_path = Path(log_path)
         self._log_path.parent.mkdir(parents=True, exist_ok=True)
         self._interval = interval_seconds
@@ -57,6 +59,15 @@ class ReconciliationService:
         self._timer: Optional[threading.Timer] = None
         self._running = False
         self._lock = threading.Lock()
+
+    def set_scheduler(self, scheduler) -> None:
+        """
+        Inject the AutonomousScheduler after construction.
+        Called by the scheduler's start() so it becomes the primary
+        source for _get_internal_positions().
+        """
+        self._scheduler = scheduler
+        logger.info("[RECON] AutonomousScheduler registered as position source")
 
     # ------------------------------------------------------------------
     # CORE RECONCILIATION
@@ -124,7 +135,31 @@ class ReconciliationService:
         return result
 
     def _get_internal_positions(self) -> List[Dict[str, Any]]:
-        """Extract internal open positions from orchestrator."""
+        """
+        Extract internal open positions.
+
+        Primary source: scheduler's _open_positions registry (populated on
+        every ORDER_FILLED event).  Falls back to the legacy orchestrator
+        _open_positions list so the old /api/signal path still works.
+        """
+        # ---- Primary: scheduler registry (plain dicts, always up-to-date) ----
+        try:
+            if self._scheduler is not None:
+                sched_positions = self._scheduler.get_open_positions()
+                if sched_positions:
+                    return [
+                        {
+                            "instrument": p.get("symbol", ""),
+                            "direction": p.get("direction", ""),
+                            "unrealized_pnl": p.get("unrealized_pnl", 0.0),
+                            "size_lots": p.get("units", 0.0),
+                        }
+                        for p in sched_positions
+                    ]
+        except Exception as e:
+            logger.debug(f"[RECON] Scheduler position read failed: {e}")
+
+        # ---- Fallback: legacy orchestrator open positions ----
         try:
             positions = self._orchestrator._open_positions
             return [

@@ -761,8 +761,43 @@ async def rejection_history_detail(limit: int = 50):
 
 @app.get("/api/positions")
 async def get_internal_positions():
-    """Internal (engine-tracked) open positions."""
+    """
+    Internal (engine-tracked) open positions.
+
+    Primary source: AutonomousScheduler._open_positions registry — populated
+    immediately on every ORDER_FILLED event and persisted to disk.
+    Falls back to the legacy AgentOrchestrator list for the /api/signal path.
+    """
     try:
+        # ---- Primary: scheduler registry ----
+        try:
+            sched = get_scheduler()
+            sched_positions = sched.get_open_positions()
+            if sched_positions:
+                return {
+                    "open_count": len(sched_positions),
+                    "positions": [
+                        {
+                            "id": p.get("id", "")[:8] if p.get("id") else "",
+                            "instrument": p.get("symbol", ""),
+                            "direction": p.get("direction", ""),
+                            "lots": p.get("units", 0.0),
+                            "entry": p.get("entry_price", 0.0),
+                            "sl": p.get("stop_loss", 0.0),
+                            "tp": p.get("take_profit", 0.0),
+                            "unrealized_pnl": round(p.get("unrealized_pnl", 0.0), 2),
+                            "opened": p.get("entry_time", ""),
+                            "strategy": p.get("strategy", ""),
+                            "risk_usd": round(p.get("risk_usd", 0.0), 2),
+                        }
+                        for p in sched_positions
+                    ],
+                    "source": "scheduler",
+                }
+        except Exception:
+            pass  # fall through to legacy path
+
+        # ---- Fallback: legacy orchestrator list ----
         orch = get_orchestrator()
         return {
             "open_count": len(orch._open_positions),
@@ -781,9 +816,10 @@ async def get_internal_positions():
                 }
                 for p in orch._open_positions
             ],
+            "source": "orchestrator",
         }
     except Exception as e:
-        return {"error": str(e), "positions": []}
+        return {"error": str(e), "open_count": 0, "positions": []}
 
 
 @app.post("/api/backtest/run")

@@ -223,6 +223,13 @@ class AutonomousScheduler:
         # Loop failure tracking
         self._loop_failures: Dict[str, int] = {}
 
+        # -----------------------------------------------------------------
+        # Internal open-position registry (Fix: track fills here so that
+        # /api/positions and ReconciliationService see them immediately)
+        # -----------------------------------------------------------------
+        self._open_positions: List[dict] = []   # list of plain position dicts
+        self._position_lock = threading.Lock()
+
         logger.info(
             f"[AutonomousScheduler] Initialised — "
             f"data={self._data_interval}s "
@@ -230,6 +237,93 @@ class AutonomousScheduler:
             f"position={self._position_interval}s "
             f"health={self._health_interval}s"
         )
+
+    # ------------------------------------------------------------------
+    # POSITION REGISTRY  (single source of truth for /api/positions)
+    # ------------------------------------------------------------------
+
+    def _register_open_position(
+        self,
+        signal,
+        order_id: str,
+        fill_price: float,
+        strategy_name: str,
+        risk_usd: float,
+    ) -> dict:
+        """
+        Create an internal position record immediately after a fill is
+        confirmed by BrokerManager.submit_order().  Writes to both the
+        in-memory list and the PositionStateStore on disk so the state
+        survives restarts and is visible to ReconciliationService.
+        """
+        pos = {
+            "id": order_id,
+            "symbol": signal.symbol,
+            "strategy": strategy_name,
+            "direction": signal.direction,
+            "entry_price": fill_price or signal.entry_price,
+            "stop_loss": signal.stop_loss,
+            "take_profit": signal.take_profit,
+            "entry_time": datetime.now(timezone.utc).isoformat(),
+            "units": signal.position_size,
+            "risk_usd": risk_usd,
+            "unrealized_pnl": 0.0,
+            "notional_usd": abs(signal.position_size * (fill_price or signal.entry_price)),
+            "asset_class": getattr(signal, "asset_class", "UNKNOWN"),
+        }
+        with self._position_lock:
+            # Deduplicate by id — only one record per order_id
+            self._open_positions = [
+                p for p in self._open_positions if p.get("id") != order_id
+            ]
+            self._open_positions.append(pos)
+
+        # Persist immediately
+        pm = self._get_persistence_manager()
+        if pm:
+            try:
+                pm.positions.upsert(pos)
+            except Exception as e:
+                logger.warning(f"[Scheduler] Failed to persist position {order_id}: {e}")
+
+        logger.info(
+            f"[Scheduler] Position REGISTERED: {signal.symbol} {signal.direction} "
+            f"order_id={order_id} entry={pos['entry_price']} "
+            f"units={signal.position_size} risk_usd={risk_usd:.2f}"
+        )
+        return pos
+
+    def _remove_open_position(self, position_id: str, symbol: str, reason: str):
+        """
+        Remove an internal position record when a close/cancel is executed.
+        Updates both in-memory list and PositionStateStore.
+        """
+        with self._position_lock:
+            before = len(self._open_positions)
+            self._open_positions = [
+                p for p in self._open_positions if p.get("id") != position_id
+            ]
+            removed = before - len(self._open_positions)
+
+        if removed:
+            pm = self._get_persistence_manager()
+            if pm:
+                try:
+                    pm.positions.remove(position_id)
+                except Exception as e:
+                    logger.warning(
+                        f"[Scheduler] Failed to remove persisted position "
+                        f"{position_id}: {e}"
+                    )
+            logger.info(
+                f"[Scheduler] Position REMOVED: {symbol} id={position_id} "
+                f"reason={reason}"
+            )
+
+    def get_open_positions(self) -> List[dict]:
+        """Return a snapshot of the current internal open positions list."""
+        with self._position_lock:
+            return list(self._open_positions)
 
     def _get_risk_governor(self):
         """Lazy-load RiskGovernor."""
@@ -341,6 +435,27 @@ class AutonomousScheduler:
                 pm.run_startup_reconciliation(self._broker_manager)
             except Exception as e:
                 logger.error(f"[Scheduler] Startup reconciliation failed: {e}")
+            # Reload open positions from persistence store into memory so that
+            # /api/positions reflects any positions that existed before restart.
+            try:
+                recovered = pm.positions.get_all()
+                with self._position_lock:
+                    self._open_positions = list(recovered)
+                logger.info(
+                    f"[Scheduler] Loaded {len(recovered)} open position(s) "
+                    "from persistence store on startup"
+                )
+            except Exception as e:
+                logger.warning(f"[Scheduler] Failed to reload persisted positions: {e}")
+
+        # Register this scheduler with the reconciliation service so it can
+        # use our position registry as its primary source.
+        try:
+            recon_svc = getattr(self._broker_manager, "_recon_svc", None)
+            if recon_svc and hasattr(recon_svc, "set_scheduler"):
+                recon_svc.set_scheduler(self)
+        except Exception as e:
+            logger.debug(f"[Scheduler] Could not register with recon service: {e}")
 
         loops = [
             ("market-data-loop",      self._market_data_loop,    self._data_interval),
@@ -672,8 +787,8 @@ class AutonomousScheduler:
 
             # ---- Intent Layer (validator → risk → execution)
             try:
-                executed = self._process_signal_through_intent_layer(signal)
-                if executed:
+                fill_result = self._process_signal_through_intent_layer(signal)
+                if fill_result:
                     # Mark signal as submitted (dedup)
                     if signal_id and pm:
                         pm.signal_dedup.mark_submitted(signal_id)
@@ -682,6 +797,21 @@ class AutonomousScheduler:
                         rg.record_trade_opened(symbol, strategy_name, risk_usd)
                     if alloc:
                         alloc.record_position_opened(strategy_name, risk_usd)
+
+                    # --------------------------------------------------------
+                    # FIX: register the filled position in the internal store
+                    # so /api/positions and ReconciliationService see it now.
+                    # --------------------------------------------------------
+                    order_id    = fill_result.order_id or ""
+                    fill_price  = fill_result.filled_price or signal.entry_price
+                    self._register_open_position(
+                        signal=signal,
+                        order_id=order_id,
+                        fill_price=fill_price,
+                        strategy_name=strategy_name,
+                        risk_usd=risk_usd,
+                    )
+
                     # Alert
                     if self._alert:
                         self._alert.emit(
@@ -691,11 +821,12 @@ class AutonomousScheduler:
                                 "symbol": symbol,
                                 "strategy": strategy_name,
                                 "direction": signal.direction,
-                                "entry": signal.entry_price,
+                                "entry": fill_price,
                                 "sl": signal.stop_loss,
                                 "tp": signal.take_profit,
                                 "units": signal.position_size,
                                 "risk_usd": risk_usd,
+                                "order_id": order_id,
                             },
                         )
             except Exception as exc:
@@ -705,8 +836,13 @@ class AutonomousScheduler:
                     exc_info=True,
                 )
 
-    def _process_signal_through_intent_layer(self, signal) -> bool:
-        """Full Intent Layer: tradeability → StrategyValidator → RiskGuardian → Execution."""
+    def _process_signal_through_intent_layer(self, signal):
+        """
+        Full Intent Layer: tradeability → StrategyValidator → RiskGuardian → Execution.
+
+        Returns the OrderResult on success (truthy, with .order_id and .filled_price),
+        or None/False on rejection so callers can test ``if result:``.
+        """
         from brokers.base_connector import OrderRequest, OrderSide, OrderType
 
         # 1. Tradeability gate
@@ -716,7 +852,7 @@ class AutonomousScheduler:
                 f"[IntentLayer] {signal.symbol} not tradeable: "
                 f"{tradeable.rejection_code}"
             )
-            return False
+            return None
 
         # 2. StrategyValidator gate
         if self._orchestrator and hasattr(self._orchestrator, "_strategy_validator_agent"):
@@ -725,7 +861,7 @@ class AutonomousScheduler:
                 valid, reason = sv.validate_signal(signal)
                 if not valid:
                     logger.info(f"[IntentLayer] StrategyValidator REJECTED: {reason}")
-                    return False
+                    return None
 
         # 3. RiskGuardian gate (agent-level)
         if self._orchestrator and hasattr(self._orchestrator, "_risk_guardian_agent"):
@@ -734,7 +870,7 @@ class AutonomousScheduler:
                 approved, reason = rg.approve_signal(signal)
                 if not approved:
                     logger.info(f"[IntentLayer] RiskGuardian REJECTED: {reason}")
-                    return False
+                    return None
 
         # 4. Build and submit order via BrokerManager
         side = OrderSide.BUY if signal.direction == "BUY" else OrderSide.SELL
@@ -758,7 +894,7 @@ class AutonomousScheduler:
                 f"[IntentLayer] ORDER SUBMITTED: {signal.symbol} {signal.direction} "
                 f"units={signal.position_size} order_id={result.order_id}"
             )
-            return True
+            return result          # truthy OrderResult carrying order_id + filled_price
         else:
             logger.warning(
                 f"[IntentLayer] ORDER REJECTED: {signal.symbol} "
@@ -767,7 +903,7 @@ class AutonomousScheduler:
             rg = self._get_risk_governor()
             if rg:
                 rg.record_broker_reject(signal.symbol, result.reject_reason or "")
-            return False
+            return None
 
     # ------------------------------------------------------------------
     # LOOP 4: POSITION MANAGEMENT
@@ -858,6 +994,12 @@ class AutonomousScheduler:
                         f"[PositionManager] CLOSED {action.symbol}: "
                         f"{action.reason}"
                     )
+                    # FIX: remove from internal position registry on close
+                    self._remove_open_position(
+                        position_id=action.position_id,
+                        symbol=action.symbol,
+                        reason=action.reason,
+                    )
                     if self._alert:
                         self._alert.emit(
                             "TRADE_CLOSED",
@@ -926,8 +1068,75 @@ class AutonomousScheduler:
                         )
                 else:
                     logger.debug("[ReconciliationLoop] State CLEAN")
+
+                # ---------------------------------------------------------
+                # BROKER-ONLY REPAIR PATH (deterministic — no order resubmit)
+                #
+                # If the broker holds positions that the engine doesn't know
+                # about (e.g. filled while the engine was down), import them
+                # into the internal registry so subsequent loops manage them
+                # correctly and reconciliation no longer marks them as ghosts.
+                # ---------------------------------------------------------
+                broker_only = result.get("broker_only_positions", [])
+                if broker_only:
+                    self._import_broker_only_positions(broker_only)
+
         except Exception as exc:
             logger.error(f"[ReconciliationLoop] Exception: {exc}")
+
+    def _import_broker_only_positions(self, broker_only_symbols: list):
+        """
+        Import positions that exist at the broker but are missing from the
+        internal registry.  Fetches live broker data and creates minimal
+        position records without resubmitting orders.
+        """
+        try:
+            broker_positions = self._broker_manager.get_positions()
+            if not broker_positions:
+                return
+
+            known_symbols = {p.get("symbol") for p in self.get_open_positions()}
+            pm = self._get_persistence_manager()
+
+            for bp in broker_positions:
+                symbol = bp.instrument
+                if symbol not in broker_only_symbols:
+                    continue
+                if symbol in known_symbols:
+                    continue  # already registered — skip
+
+                order_id = getattr(bp, "order_id", None) or getattr(bp, "id", "")
+                direction = bp.side.value if hasattr(bp.side, "value") else str(bp.side)
+                pos = {
+                    "id": order_id or f"broker_{symbol}_{int(time.time())}",
+                    "symbol": symbol,
+                    "strategy": getattr(bp, "strategy", "unknown"),
+                    "direction": direction,
+                    "entry_price": getattr(bp, "avg_price", 0.0),
+                    "stop_loss": getattr(bp, "stop_loss", 0.0),
+                    "take_profit": getattr(bp, "take_profit", 0.0),
+                    "entry_time": getattr(bp, "open_time", datetime.now(timezone.utc).isoformat()),
+                    "units": bp.units,
+                    "risk_usd": 0.0,
+                    "unrealized_pnl": getattr(bp, "unrealized_pnl", 0.0),
+                    "notional_usd": abs(bp.units * getattr(bp, "avg_price", 0.0)),
+                    "asset_class": getattr(bp, "asset_class", "UNKNOWN"),
+                    "_imported_by_reconciliation": datetime.now(timezone.utc).isoformat(),
+                }
+                with self._position_lock:
+                    self._open_positions.append(pos)
+                if pm:
+                    try:
+                        pm.positions.upsert(pos)
+                    except Exception:
+                        pass
+                logger.warning(
+                    f"[ReconciliationLoop] IMPORTED broker-only position: "
+                    f"{symbol} {direction} units={bp.units} "
+                    f"order_id={pos['id']}"
+                )
+        except Exception as e:
+            logger.error(f"[ReconciliationLoop] broker-only import failed: {e}")
 
     # ------------------------------------------------------------------
     # LOOP 6: HEALTH MONITOR (Broker Supervisor)
