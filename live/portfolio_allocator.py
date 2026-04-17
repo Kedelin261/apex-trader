@@ -148,6 +148,22 @@ class PortfolioAllocator:
                 alloc.max_concurrent_positions = int(cfg["max_concurrent_positions"])
             self._strategies[name] = alloc
 
+        # Load any additional strategies defined only in config (e.g., disabled_strategy)
+        for name, cfg in strategy_cfgs.items():
+            if name not in self._strategies:
+                alloc = StrategyAllocation(
+                    name=name,
+                    enabled=cfg.get("enabled", True),
+                    priority=int(cfg.get("priority", 5)),
+                    max_risk_budget_pct=float(cfg.get("max_risk_budget_pct", 10.0)),
+                    max_concurrent_positions=int(cfg.get("max_concurrent_positions", 2)),
+                )
+                self._strategies[name] = alloc
+                logger.debug(
+                    f"[Allocator] Loaded config-only strategy: {name!r} "
+                    f"(enabled={alloc.enabled})"
+                )
+
     # ------------------------------------------------------------------
     # PUBLIC: Main gate
     # ------------------------------------------------------------------

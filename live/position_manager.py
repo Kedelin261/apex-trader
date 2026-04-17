@@ -319,7 +319,7 @@ class PositionManager:
                     position_id=pos_id, symbol=symbol,
                     action="MOVE_SL",
                     reason=(
-                        f"BREAK_EVEN: profit={profit:.5f} >= threshold={be_threshold:.5f} — "
+                        f"BE_MOVE (BREAK_EVEN): profit={profit:.5f} >= threshold={be_threshold:.5f} — "
                         f"moving SL from {sl:.5f} to {new_sl:.5f}"
                     ),
                     new_sl=round(new_sl, 5),
@@ -334,7 +334,7 @@ class PositionManager:
                     position_id=pos_id, symbol=symbol,
                     action="MOVE_SL",
                     reason=(
-                        f"BREAK_EVEN: profit={profit:.5f} >= threshold={be_threshold:.5f} — "
+                        f"BE_MOVE (BREAK_EVEN): profit={profit:.5f} >= threshold={be_threshold:.5f} — "
                         f"moving SL from {sl:.5f} to {new_sl:.5f}"
                     ),
                     new_sl=round(new_sl, 5),
